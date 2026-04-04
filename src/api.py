@@ -5,8 +5,10 @@ from contextlib import asynccontextmanager
 import asyncio
 import logging
 import hashlib
+import secrets
 import subprocess
 import uuid
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 from typing import Optional, List, Dict
 from pydantic import BaseModel, field_validator
@@ -423,8 +425,9 @@ if not os.path.exists(static_path):
     # Fallback to /app/static for Docker or current working directory
     static_path = os.path.join(os.getcwd(), "static")
     if not os.path.exists(static_path):
-        # Last resort: try parent directory
-        static_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # Static directory is missing — do not fall back to project root
+        # (that would expose source files via path traversal)
+        logger.error("❌ Static files directory not found — static file serving will be unavailable")
 
 # Verify static path exists and log it
 if os.path.exists(static_path):
@@ -504,18 +507,24 @@ async def custom_swagger_ui_html():
 @app.get("/static/{filename:path}", include_in_schema=False)
 async def serve_static_file(filename: str):
     """Serve static files like logo and favicon"""
-    file_path = os.path.join(static_path, filename)
-    if os.path.exists(file_path) and os.path.isfile(file_path):
+    static_root = Path(static_path).resolve()
+    resolved_file = (static_root / filename).resolve()
+    # Prevent path traversal: reject any path escaping static_root
+    if not resolved_file.is_relative_to(static_root):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    file_path = resolved_file
+    if file_path.exists() and file_path.is_file():
         # Determine media type based on extension
-        if filename.endswith(".svg"):
+        name = filename.lower()
+        if name.endswith(".svg"):
             media_type = "image/svg+xml"
-        elif filename.endswith(".png"):
+        elif name.endswith(".png"):
             media_type = "image/png"
-        elif filename.endswith(".ico"):
+        elif name.endswith(".ico"):
             media_type = "image/x-icon"
         else:
             media_type = None
-        return FileResponse(file_path, media_type=media_type)
+        return FileResponse(str(file_path), media_type=media_type)
     raise HTTPException(status_code=404, detail=f"Static file not found: {filename}")
 
 
