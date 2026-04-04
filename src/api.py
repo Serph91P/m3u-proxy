@@ -7,6 +7,8 @@ import logging
 import hashlib
 import subprocess
 import uuid
+import ipaddress
+import socket
 from urllib.parse import unquote, urlparse
 from typing import Optional, List, Dict
 from pydantic import BaseModel, field_validator
@@ -226,6 +228,30 @@ def validate_url(url: str) -> str:
     for pattern in dangerous_patterns:
         if pattern in url_lower:
             raise ValueError(f"URL contains dangerous pattern: {pattern}")
+
+    # SSRF protection: reject requests to private/internal IP ranges
+    hostname = parsed.hostname
+    if hostname:
+        try:
+            # Resolve hostname to IP (catches e.g. http://internal.corp/)
+            resolved_ip = socket.getaddrinfo(hostname, None)[0][4][0]
+            ip = ipaddress.ip_address(resolved_ip)
+            if (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+                # Block cloud metadata endpoints explicitly
+                or str(ip) == "169.254.169.254"  # AWS/GCP/Azure IMDS
+            ):
+                raise ValueError("URL resolves to a private or reserved IP address")
+        except ValueError:
+            raise
+        except Exception:
+            # If DNS resolution fails, let the proxy attempt it (stream URLs may use private DNS)
+            pass
 
     return url
 
