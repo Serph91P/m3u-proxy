@@ -10,9 +10,9 @@ def get_redis_config() -> dict:
     """Get Redis configuration"""
     # Build Redis URL from components or use explicit URL if provided
     # Format: redis://[:password@]host:port/db
-    # Use REDIS_PASSWORD if set, otherwise fall back to API_TOKEN (same as M3U_PROXY_TOKEN)
-    # This ensures both m3u-editor and m3u-proxy use the same password
-    redis_password = settings.REDIS_PASSWORD or settings.API_TOKEN
+    # Use REDIS_PASSWORD if explicitly set; do not fall back to API_TOKEN to
+    # keep authentication credentials independent.
+    redis_password = settings.REDIS_PASSWORD or None
 
     if redis_password:
         redis_url = os.getenv(
