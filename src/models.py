@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, HttpUrl
 from typing import List, Optional, Dict, Any
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 try:
@@ -96,7 +96,7 @@ class StreamEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     event_type: EventType
     stream_id: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     data: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -126,5 +126,5 @@ class ProxyStats(BaseModel):
 class HealthCheck(BaseModel):
     status: str
     version: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     dependencies: Dict[str, str] = Field(default_factory=dict)
