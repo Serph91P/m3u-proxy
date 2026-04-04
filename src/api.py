@@ -649,8 +649,8 @@ async def get_info():
             "pooling_enabled": use_pooling,
             "host": redis_config.get("host") if settings.REDIS_ENABLED else None,
             "port": redis_config.get("port") if settings.REDIS_ENABLED else None,
-            "password": redis_config.get("password")
-            if settings.REDIS_ENABLED
+            "password": "***"
+            if (settings.REDIS_ENABLED and redis_config.get("password"))
             else None,
             "db": redis_config.get("db") if settings.REDIS_ENABLED else None,
             "max_clients_per_stream": settings.MAX_CLIENTS_PER_SHARED_STREAM
