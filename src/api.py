@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import logging
 import hashlib
+import secrets
 import subprocess
 import uuid
 from urllib.parse import unquote, urlparse
@@ -598,8 +599,8 @@ async def verify_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Verify the token matches
-    if provided_token != settings.API_TOKEN:
+    # Verify the token matches (constant-time comparison to prevent timing attacks)
+    if not secrets.compare_digest(provided_token, settings.API_TOKEN):
         raise HTTPException(
             status_code=403,
             detail="Invalid API token",
