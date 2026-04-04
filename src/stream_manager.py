@@ -819,7 +819,7 @@ class StreamManager:
                     )
 
             del self.clients[client_id]
-            self._stats.active_clients -= 1
+            self._stats.active_clients = max(0, self._stats.active_clients - 1)
 
             # Clean up cancel event for this connection
             if connection_id and connection_id in self.connection_cancel_events:
