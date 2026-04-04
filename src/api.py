@@ -439,10 +439,13 @@ else:
     logger.error(f"Script directory: {os.path.dirname(os.path.abspath(__file__))}")
 
 # Configure CORS to allow all origins for streaming compatibility
+# Note: allow_credentials=True is incompatible with allow_origins=["*"] per
+# the CORS spec — browsers will reject credentialed requests to a wildcard
+# origin. Use allow_credentials=False so wildcard origin works correctly.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allow all origins for maximum compatibility
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],  # Allow all methods (GET, POST, HEAD, OPTIONS, etc.)
     allow_headers=["*"],  # Allow all headers
     expose_headers=["*"],  # Expose all headers to the client
