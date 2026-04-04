@@ -14,9 +14,11 @@ class EventManager:
         self.event_handlers: List[callable] = []
         self._running = False
         self._worker_task: Optional[asyncio.Task] = None
+        self._http_client: Optional[httpx.AsyncClient] = None
 
     async def start(self):
         """Start the event manager worker."""
+        self._http_client = httpx.AsyncClient()
         self._running = True
         self._worker_task = asyncio.create_task(self._process_events())
         logger.info("Event manager started")
@@ -30,6 +32,9 @@ class EventManager:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
         logger.info("Event manager stopped")
 
     def add_webhook(self, webhook: WebhookConfig):
@@ -118,17 +123,23 @@ class EventManager:
 
         for attempt in range(webhook.retry_attempts + 1):
             try:
-                async with httpx.AsyncClient(timeout=webhook.timeout) as client:
-                    response = await client.post(
-                        str(webhook.url), json=payload, headers=headers
+                client = self._http_client
+                if client is None:
+                    logger.warning("HTTP client not initialised, skipping webhook")
+                    return
+                response = await client.post(
+                    str(webhook.url),
+                    json=payload,
+                    headers=headers,
+                    timeout=webhook.timeout,
+                )
+                if response.status_code < 400:
+                    logger.debug(f"Webhook sent successfully to {webhook.url}")
+                    return
+                else:
+                    logger.warning(
+                        f"Webhook failed with status {response.status_code}: {webhook.url}"
                     )
-                    if response.status_code < 400:
-                        logger.debug(f"Webhook sent successfully to {webhook.url}")
-                        return
-                    else:
-                        logger.warning(
-                            f"Webhook failed with status {response.status_code}: {webhook.url}"
-                        )
 
             except Exception as e:
                 logger.warning(
