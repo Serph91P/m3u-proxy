@@ -331,9 +331,6 @@ class TranscodeCreateRequest(BaseModel):
     silence_check_interval: Optional[float] = None
     silence_failover_threshold: Optional[int] = None
     silence_monitoring_grace_period: Optional[float] = None
-    # Seconds to retry the same URL before failover on a live silent close
-    # (None = use the LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS ENV default, 0 = off)
-    silent_close_retry_window: Optional[float] = None
     profile: Optional[str] = None  # Profile name or custom template
     profile_variables: Optional[Dict[str, str]] = None
     output_format: Optional[str] = None  # mp4, mkv, ts, etc.
@@ -1009,7 +1006,6 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
             silence_check_interval=request.silence_check_interval,
             silence_failover_threshold=request.silence_failover_threshold,
             silence_monitoring_grace_period=request.silence_monitoring_grace_period,
-            silent_close_retry_window=request.silent_close_retry_window,
         )
 
         # Emit stream started event with transcoding info

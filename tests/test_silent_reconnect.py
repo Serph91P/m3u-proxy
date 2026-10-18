@@ -524,3 +524,63 @@ async def test_failover_url_gets_its_own_same_url_retry(monkeypatch):
         failover_url,
         failover_url,
     ], f"Expected the failover feed to get its own same-URL retry, got {requested_urls}"
+
+
+@pytest.mark.asyncio
+async def test_same_url_retry_window_survives_resolver_rotating_back(monkeypatch):
+    """
+    The retry window is remembered for every URL, not just the last one retried.
+    If a resolver rotates back to a URL whose same-URL retry died moments ago,
+    that URL is genuinely failing, so the proxy fails over again instead of
+    spending another retry on it.
+    """
+    manager = _make_manager()
+
+    monkeypatch.setattr("config.settings.STREAM_RETRY_ATTEMPTS", 0)
+    monkeypatch.setattr("config.settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS", 5)
+    monkeypatch.setattr("config.settings.LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS", 60.0)
+    monkeypatch.setattr("config.settings.MAX_FAILOVER_ATTEMPTS", 10)
+    monkeypatch.setattr("config.settings.LIVE_CHUNK_TIMEOUT_SECONDS", 1.0)
+
+    primary_url = "http://provider.example.com/live/primary.ts"
+    failover_url = "http://provider.example.com/live/failover.ts"
+    last_url = "http://provider.example.com/live/last.ts"
+    stream_id = await manager.get_or_create_stream(
+        primary_url, failover_urls=[failover_url]
+    )
+
+    # The resolver hands out the failover, then the primary again, then a last URL.
+    resolved = iter([failover_url, primary_url, last_url])
+
+    async def fake_resolve(stream_id, reason="unknown"):
+        return next(resolved, None)
+
+    monkeypatch.setattr(manager, "_resolve_next_failover_url", fake_resolve)
+
+    chunk_data = b"U" * 32768
+    requested_urls = []
+    # Primary plays then drops, its retry dies, the failover plays then drops,
+    # its retry dies, the primary plays then drops again.
+    plan = [10, 0, 10, 0, 10]
+
+    async def fake_stream(method, url, headers=None, follow_redirects=True):
+        requested_urls.append(url)
+        index = len(requested_urls) - 1
+        count = plan[index] if index < len(plan) else 0
+        return _MockStreamCM(
+            _response_from_iter(_make_chunks_then_stop(chunk_data, count))
+        )
+
+    monkeypatch.setattr(manager.live_stream_client, "stream", fake_stream)
+
+    response = await manager.stream_continuous_direct(stream_id, "test_client")
+    await _collect(response)
+
+    assert requested_urls[:6] == [
+        primary_url,
+        primary_url,
+        failover_url,
+        failover_url,
+        primary_url,
+        last_url,
+    ], f"Expected the primary's recent retry to be remembered, got {requested_urls}"

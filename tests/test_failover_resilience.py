@@ -206,3 +206,42 @@ async def test_transcode_input_error_advances_one_failover(monkeypatch):
     )
     assert manager.streams[stream_id].failover_attempts == 1
     assert b"".join(chunks) == b"V" * 1024
+
+
+@pytest.mark.asyncio
+async def test_transcode_start_error_without_failover_url_asks_resolver_once(
+    monkeypatch,
+):
+    """When ffmpeg fails to start and there is no failover URL, the proxy gives up
+    after one resolver call instead of asking again from the error handler."""
+    monkeypatch.setattr("config.settings.MAX_FAILOVER_ATTEMPTS", 0)
+
+    manager = StreamManager()
+    manager.pooled_manager = Mock(spec=PooledStreamManager)
+
+    stream_id = await manager.get_or_create_stream(
+        "http://provider.example.com/live/primary.ts",
+        failover_urls=["http://provider.example.com/live/failover1.ts"],
+        is_transcoded=True,
+        transcode_profile="h264_720p",
+        transcode_ffmpeg_args=["-c:v", "libx264"],
+    )
+
+    resolver_calls = []
+
+    async def fake_resolve(stream_id, reason="unknown"):
+        resolver_calls.append(reason)
+        return None
+
+    monkeypatch.setattr(manager, "_resolve_next_failover_url", fake_resolve)
+    manager.pooled_manager.get_or_create_shared_stream = AsyncMock(
+        return_value=("key_1", None)
+    )
+    manager.pooled_manager.force_stop_stream = AsyncMock()
+    manager.pooled_manager.remove_client_from_stream = AsyncMock()
+
+    response = await manager.stream_transcoded(stream_id, "test_client")
+    chunks = await asyncio.wait_for(_collect(response), timeout=10)
+
+    assert chunks == []
+    assert resolver_calls == ["transcode_start_error"]

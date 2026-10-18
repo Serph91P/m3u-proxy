@@ -1831,8 +1831,9 @@ class StreamManager:
             vod_reconnects = 0
             failover_count = 0
             silent_reconnect_count = 0
-            last_same_url_retry_time = None
-            last_same_url_retry_url = None
+            # Loop time of the last same-URL retry, per URL (a resolver can rotate back
+            # to a URL it already used, so only remembering the last one is not enough)
+            last_same_url_retry_times: dict[str, float] = {}
             skip_prebuffer = False
             mark_discontinuity = False
             chunk_count_at_last_reconnect = 0
@@ -2801,15 +2802,14 @@ class StreamManager:
                                 and retry_window > 0
                                 and chunks_this_connection >= min_chunks
                                 and (
-                                    last_same_url_retry_time is None
-                                    or last_same_url_retry_url != active_url
-                                    or now - last_same_url_retry_time >= retry_window
+                                    active_url not in last_same_url_retry_times
+                                    or now - last_same_url_retry_times[active_url]
+                                    >= retry_window
                                 )
                             )
                             if retry_same_url:
                                 silent_reconnect_count += 1
-                                last_same_url_retry_time = now
-                                last_same_url_retry_url = active_url
+                                last_same_url_retry_times[active_url] = now
                                 logger.warning(
                                     f"Live stream ended unexpectedly for client {client_id} "
                                     f"({chunks_this_connection} chunks this connection, "
@@ -3795,10 +3795,12 @@ class StreamManager:
                                 if not await self._try_update_failover_url(
                                     stream_id, "transcode_start_error"
                                 ):
-                                    raise HTTPException(
-                                        status_code=502,
-                                        detail="Failed to start transcoding and no failover URL available",
+                                    # Return rather than raise: an HTTPException here would be
+                                    # caught by the handler below, which asks the resolver again.
+                                    logger.error(
+                                        f"No failover URL available for stream {stream_id}, giving up"
                                     )
+                                    return
                                 failover_count += 1
                                 continue
                             else:
