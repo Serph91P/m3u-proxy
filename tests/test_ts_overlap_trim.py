@@ -156,6 +156,77 @@ def test_trimmer_does_not_arm_without_enough_delivered_data():
     assert trimmer.pending is False
 
 
+def _feed_in_chunks(trimmer, data: bytes, sizes):
+    """Feed `data` using the repeating chunk-size pattern `sizes` until the
+    trimmer stops pending. Returns (bytes emitted, result, bytes consumed)."""
+    out, offset, i, result = [], 0, 0, TRIM_PENDING
+    while trimmer.pending and offset < len(data):
+        size = sizes[i % len(sizes)]
+        chunk, result = trimmer.feed(data[offset : offset + size], now=0.0)
+        out.append(chunk)
+        offset += size
+        i += 1
+    return b"".join(out), result, offset
+
+
+def test_trimmer_finds_overlap_when_fed_one_byte_at_a_time():
+    stream = _payload(100_000)
+    trimmer = _trimmer()
+    trimmer.record(stream[:60_000])
+    trimmer.arm()
+
+    out, result, consumed = _feed_in_chunks(trimmer, stream[40_000:], [1])
+
+    assert result == TRIM_MATCHED
+    assert trimmer.last_trimmed_bytes == 20_000
+    assert consumed == 20_000  # stopped on the exact last byte of the signature
+    assert out == b""
+
+
+def test_trimmer_finds_signature_split_at_any_chunk_boundary():
+    stream = _payload(100_000)
+    # signature = stream[55_904:60_000]; split it 1 byte, mid-way and 1 byte from the end
+    for split in (55_905, 57_952, 59_999):
+        trimmer = _trimmer()
+        trimmer.record(stream[:60_000])
+        trimmer.arm()
+
+        assert trimmer.feed(stream[50_000:split], now=0.0) == (b"", TRIM_PENDING)
+        out, result = trimmer.feed(stream[split:70_000], now=0.1)
+
+        assert result == TRIM_MATCHED, split
+        assert out == stream[60_000:70_000], split
+
+
+def test_trimmer_result_does_not_depend_on_chunking():
+    """The search only scans new data (plus a signature-length overlap), so the
+    match must be identical however the upstream bytes are chunked, including
+    repetitive data where the earliest of several matches must win."""
+    unit = _payload(1_000)
+    cases = {
+        "random": _payload(200_000),
+        "repetitive": unit * 200,
+    }
+    patterns = [[200_000], [1], [7], [4095, 1], [32768], [1, 3000, 17, 65536]]
+    for name, stream in cases.items():
+        expected = None
+        for sizes in patterns:
+            trimmer = _trimmer()
+            trimmer.record(stream[:150_000])
+            trimmer.arm()
+            out, result, consumed = _feed_in_chunks(trimmer, stream[100_000:], sizes)
+            # out ends wherever the last chunk did, so compare it against the
+            # stream position that chunk reached rather than across patterns
+            assert (
+                out == stream[100_000 + trimmer.last_trimmed_bytes : 100_000 + consumed]
+            ), (name, sizes)
+            got = (result, trimmer.last_trimmed_bytes)
+            if expected is None:
+                expected = got
+            assert got == expected, (name, sizes)
+            assert result == TRIM_MATCHED, (name, sizes)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: silent reconnect through stream_continuous_direct
 # ---------------------------------------------------------------------------

@@ -171,7 +171,8 @@ class Settings(BaseSettings):
     STRICT_LIVE_TS_OVERLAP_SIGNATURE_SIZE: int = 16384  # 16 KB
     # Maximum bytes to hold from the new connection while searching for the overlap
     STRICT_LIVE_TS_OVERLAP_MAX_SEARCH_SIZE: int = 8388608  # 8 MB
-    # Maximum seconds (after the first byte of the new connection) to hold data while searching
+    # Maximum seconds (after the first byte of the new connection) to hold data while searching.
+    # Whichever limit is hit first ends the search, so raise this together with MAX_SEARCH_SIZE.
     STRICT_LIVE_TS_OVERLAP_MAX_WAIT: float = 0.5
 
     # Bitrate Quality Monitoring - detect slow/degraded streams and trigger failover

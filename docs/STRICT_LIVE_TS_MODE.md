@@ -118,6 +118,10 @@ STRICT_LIVE_TS_PREBUFFER_TIMEOUT=10
 # locates the last delivered bytes in the new connection and drops everything
 # up to them, so playback continues from the exact next byte (no jump-back).
 # If no match is found, the held data is forwarded unchanged.
+# The search stops at whichever limit is hit first (MAX_SEARCH_SIZE bytes or
+# MAX_WAIT seconds). For high-bitrate (e.g. 4K) channels whose providers resend
+# more than 8 MB after a reconnect, raise both: a larger MAX_SEARCH_SIZE has no
+# effect if MAX_WAIT expires first.
 STRICT_LIVE_TS_OVERLAP_TRIM=true
 STRICT_LIVE_TS_OVERLAP_SIGNATURE_SIZE=16384
 STRICT_LIVE_TS_OVERLAP_MAX_SEARCH_SIZE=8388608

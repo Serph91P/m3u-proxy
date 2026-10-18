@@ -50,6 +50,7 @@ class OverlapTrimmer:
         self._signature: Optional[bytes] = None
         self._search_buffer = bytearray()
         self._search_started_at: Optional[float] = None
+        self._searched = 0
         self.last_trimmed_bytes = 0
 
     @property
@@ -74,6 +75,7 @@ class OverlapTrimmer:
         """
         self._search_buffer = bytearray()
         self._search_started_at = None
+        self._searched = 0
         if len(self._tail) < self.MIN_SIGNATURE_BYTES:
             self._signature = None
             return False
@@ -94,7 +96,13 @@ class OverlapTrimmer:
             self._search_started_at = now
         self._search_buffer.extend(chunk)
 
-        match_at = self._search_buffer.find(self._signature)
+        # Only search the new data plus enough of the old tail to catch a
+        # signature that straddles the chunk boundary. Earlier calls already
+        # ruled out every start position before that, so the result is the
+        # same as searching the whole buffer, but the total work is linear.
+        start = max(0, self._searched - len(self._signature) + 1)
+        match_at = self._search_buffer.find(self._signature, start)
+        self._searched = len(self._search_buffer)
         if match_at != -1:
             cut = match_at + len(self._signature)
             self.last_trimmed_bytes = cut
@@ -117,3 +125,4 @@ class OverlapTrimmer:
         self._signature = None
         self._search_buffer = bytearray()
         self._search_started_at = None
+        self._searched = 0
