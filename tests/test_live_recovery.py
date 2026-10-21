@@ -199,12 +199,22 @@ async def test_same_url_reconnect_also_ends_body(manager, monkeypatch):
 async def test_timeout_selected_once_not_cb_or_eof(
     manager, monkeypatch, enabled, resolver
 ):
-    monkeypatch.setattr(settings, "STRICT_LIVE_TS_CIRCUIT_BREAKER_TIMEOUT", 0.001)
+    # Arm the tiny breaker only once the two expected packets were delivered.
+    # A busy runner may otherwise exceed 1 ms during initial setup and fire the
+    # breaker before this test reaches the timeout classification it exercises.
+    monkeypatch.setattr(settings, "STRICT_LIVE_TS_CIRCUIT_BREAKER_TIMEOUT", 3600)
+
+    async def primary():
+        yield b"A"
+        yield b"A"
+        monkeypatch.setattr(settings, "STRICT_LIVE_TS_CIRCUIT_BREAKER_TIMEOUT", 0.001)
+        await asyncio.Event().wait()
+
     opened, _ = sources(
         monkeypatch,
         manager,
         {
-            A: lambda: chunks(hang=True),
+            A: primary,
             B: lambda: chunks(b"B"),
             C: lambda: chunks(b"C"),
         },
