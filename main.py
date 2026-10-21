@@ -70,10 +70,11 @@ def _build_uvicorn_log_config(log_level: str, anonymize: bool) -> dict:
 def main():
     """Main function to start the m3u-proxy server."""
 
-    # Try to use uvloop for better async performance (2-4x faster)
+    # Try to use uvloop for better async performance (2-4x faster).
+    # uvicorn creates the uvloop event loop itself via loop="uvloop" below;
+    # asyncio.set_event_loop_policy() is deprecated as of Python 3.14.
     try:
-        import uvloop
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        import uvloop  # noqa: F401
         use_uvloop = True
     except ImportError:
         use_uvloop = False

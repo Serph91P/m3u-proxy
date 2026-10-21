@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+import inspect
 import logging
 from typing import List, Optional
 from models import StreamEvent, WebhookConfig
@@ -77,7 +78,7 @@ class EventManager:
         # Call registered handlers
         for handler in self.event_handlers:
             try:
-                if asyncio.iscoroutinefunction(handler):
+                if inspect.iscoroutinefunction(handler):
                     await handler(event)
                 else:
                     handler(event)

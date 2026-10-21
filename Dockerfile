@@ -2,31 +2,36 @@
 # Bump both together.
 FROM linuxserver/ffmpeg:8.1.2
 
-# Install Python and system dependencies
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     # Add common utilities
     pciutils \
     wget \
     nano \
-    # Python dependencies
-    python3 \
-    python3-pip \
-    python3-venv \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Deno (default JS runtime for yt-dlp's EJS challenge solver — no extra flags needed)
 COPY --from=denoland/deno:latest /usr/bin/deno /usr/local/bin/deno
 
-# Create symlink for python command
-RUN ln -s /usr/bin/python3 /usr/bin/python
+# Python comes from uv (a standalone CPython build) instead of apt, because the
+# Ubuntu 24.04 base only ships 3.12. Keep PYTHON_VERSION on the same minor as
+# the python3 in m3u-editor's Alpine base image (Alpine 3.24: 3.14), which runs
+# this same code embedded. The venv's bin is first on PATH so python3,
+# streamlink and yt-dlp all resolve to it.
+ARG PYTHON_VERSION=3.14
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ENV UV_PYTHON_INSTALL_DIR=/opt/python \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
+RUN uv venv --python ${PYTHON_VERSION} /opt/venv
 
 # Set working directory
 WORKDIR /app
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir -r requirements.txt --break-system-packages
+RUN uv pip install --no-cache -r requirements.txt
 
 # Copy application code
 COPY src/ ./src/

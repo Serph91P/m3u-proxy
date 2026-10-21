@@ -216,7 +216,7 @@ The container startup will show hardware detection results:
 
 ```
 📦 m3u-proxy starting up...
-🐍 Python version: Python 3.12.3
+🐍 Python version: Python 3.14.8
 🎬 FFmpeg version: 8.0
 🔍 Running hardware acceleration check...
 🔍 Hardware detection: NVIDIA GPU (GeForce RTX 3080)
