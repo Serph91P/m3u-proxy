@@ -1683,7 +1683,7 @@ class StreamManager:
                 except Exception as e:
                     logger.warning(
                         f"Inherited upstream for stream {stream_id} is unusable "
-                        f"({type(e).__name__}), opening a new connection"
+                        f"({type(e).__name__}), ending or reconnecting upstream"
                     )
                     try:
                         await stream_context.__aexit__(None, None, None)
@@ -1694,7 +1694,8 @@ class StreamManager:
 
             if stream_iterator is None:
                 if stream_info.end_session_on_reconnect:
-                    await self._end_direct_generation(stream_id, connection_id)
+                    # Let finally select failover before ending this generation;
+                    # resetting here would make its stale-generation guard skip it.
                     return
                 stream_context, response = await _open_fresh_upstream()
                 stream_iterator = ShieldedUpstreamReader(

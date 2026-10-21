@@ -308,6 +308,169 @@ async def test_promoted_inherited_upstream_finishes_without_generation_mix(
     assert not manager._direct_broadcast_primary
 
 
+async def failed_first_read(failure, started=None):
+    if started is not None:
+        started.set()
+    if failure == "timeout":
+        await asyncio.Event().wait()
+    if failure == "error":
+        raise httpx.ReadError("inherited upstream failed")
+    return
+    yield  # Keep EOF an async iterator without emitting any bytes.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["eof", "timeout", "error"])
+@pytest.mark.parametrize("failover", [False, True])
+async def test_promoted_inherited_first_read_failure_retains_selected_source(
+    manager, monkeypatch, failure, failover
+):
+    import api
+
+    monkeypatch.setattr(api, "stream_manager", manager)
+    opened, _ = sources(
+        monkeypatch, manager, {A: lambda: chunks(b"A"), B: lambda: chunks(b"B")}
+    )
+    payload = {
+        "url": A,
+        "failover_urls": [B] if failover else [],
+        "end_session_on_reconnect": True,
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api.app), base_url="http://test"
+    ) as client:
+        created = await client.post("/streams", json=payload)
+        assert created.status_code == 200
+        sid = created.json()["stream_id"]
+        info = manager.streams[sid]
+        ctx = AsyncMock()
+        manager._handoff_upstream[sid] = (ctx, None, failed_first_read(failure))
+        body = [
+            b
+            async for b in manager._promoted_primary_generate(
+                sid, "p", "conn", asyncio.Event()
+            )
+        ]
+        assert body == [] and opened == []  # No fresh connection or splice.
+        ctx.__aexit__.assert_awaited_once()
+        selected = B if failover else A
+        assert info.current_url == selected
+        assert info.failover_attempts == int(failover)
+        assert info.direct_generation == 1
+        assert not manager._direct_broadcast_primary
+        following = await client.get(f"/stream/{sid}")
+        assert following.status_code == 200
+        assert following.content == (b"BB" if failover else b"AA")
+        repost = await client.post("/streams", json=payload)
+        assert repost.status_code == 200 and repost.json()["stream_id"] == sid
+        assert info.current_url == selected
+        following = await client.get(f"/stream/{sid}")
+        assert following.status_code == 200
+        assert following.content == (b"BB" if failover else b"AA")
+        assert opened == [selected, selected]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["eof", "timeout", "error"])
+async def test_promoted_first_read_failure_after_reset_cannot_select_again(
+    manager, monkeypatch, failure
+):
+    sid = await manager.get_or_create_stream(
+        A, failover_urls=[B, C], end_session_on_reconnect=True
+    )
+    closing, release = asyncio.Event(), asyncio.Event()
+    ctx = AsyncMock()
+
+    async def close(*args):
+        closing.set()
+        await release.wait()
+
+    ctx.__aexit__.side_effect = close
+    manager._handoff_upstream[sid] = (ctx, None, failed_first_read(failure))
+    select = AsyncMock(wraps=manager._try_update_failover_url)
+    monkeypatch.setattr(manager, "_try_update_failover_url", select)
+    opened, _ = sources(monkeypatch, manager, {B: lambda: chunks(b"B")})
+
+    async def consume():
+        return [
+            b
+            async for b in manager._promoted_primary_generate(
+                sid, "old", "old-conn", asyncio.Event()
+            )
+        ]
+
+    pending = asyncio.create_task(consume())
+    await asyncio.wait_for(closing.wait(), 1)
+    assert await manager._try_update_failover_url(sid, "concurrent_selection")
+    await manager._end_direct_generation(sid, "old-conn")
+    fresh = await manager.stream_continuous_direct(sid, "fresh")
+    fresh_owner = manager._direct_broadcast_primary[sid]
+    release.set()
+    assert await pending == []
+    assert manager._direct_broadcast_primary[sid] == fresh_owner
+    assert manager.streams[sid].current_url == B
+    select.assert_awaited_once_with(sid, "concurrent_selection")
+    assert await _collect(fresh) == [b"B", b"B"]
+    assert opened == [B]
+    ctx.__aexit__.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["eof", "timeout", "error"])
+async def test_promoted_first_read_failure_with_cancel_event_does_not_reset(
+    manager, monkeypatch, failure
+):
+    sid = await manager.get_or_create_stream(
+        A, failover_urls=[B], end_session_on_reconnect=True
+    )
+    ctx, cancel = AsyncMock(), asyncio.Event()
+    # A disconnect arriving while the unusable inherited connection is closing
+    # must not be reclassified as an upstream-driven generation reset.
+    ctx.__aexit__.side_effect = lambda *args: cancel.set()
+    manager._handoff_upstream[sid] = (ctx, None, failed_first_read(failure))
+    select = AsyncMock(wraps=manager._try_update_failover_url)
+    monkeypatch.setattr(manager, "_try_update_failover_url", select)
+    opened, _ = sources(monkeypatch, manager, {B: lambda: chunks(b"B")})
+    assert [
+        b async for b in manager._promoted_primary_generate(sid, "p", "conn", cancel)
+    ] == []
+    assert cancel.is_set() and opened == []
+    select.assert_not_awaited()
+    assert manager.streams[sid].current_url == A
+    assert manager.streams[sid].direct_generation == 0
+    ctx.__aexit__.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_promoted_first_read_task_cancellation_does_not_select_failover(
+    manager, monkeypatch
+):
+    sid = await manager.get_or_create_stream(
+        A, failover_urls=[B], end_session_on_reconnect=True
+    )
+    started = asyncio.Event()
+    ctx, cancel = AsyncMock(), asyncio.Event()
+    manager._handoff_upstream[sid] = (
+        ctx,
+        None,
+        failed_first_read("timeout", started=started),
+    )
+    select = AsyncMock(wraps=manager._try_update_failover_url)
+    monkeypatch.setattr(manager, "_try_update_failover_url", select)
+    pending = asyncio.create_task(
+        anext(manager._promoted_primary_generate(sid, "p", "conn", cancel))
+    )
+    await asyncio.wait_for(started.wait(), 1)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert cancel.is_set()
+    select.assert_not_awaited()
+    assert manager.streams[sid].current_url == A
+    assert manager.streams[sid].direct_generation == 0
+    ctx.__aexit__.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_promoted_without_handoff_ends_instead_of_opening_upstream(
     manager, monkeypatch
