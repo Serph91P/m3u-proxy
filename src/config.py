@@ -82,6 +82,8 @@ class Settings(BaseSettings):
     REDIS_PASSWORD: Optional[str] = None
     REDIS_ENABLED: bool = False
     ENABLE_TRANSCODING_POOLING: bool = True
+    # Opt in to the existing local FFmpeg manager without Redis; one process only.
+    ENABLE_SINGLE_PROCESS_TRANSCODING: bool = False
     MAX_CLIENTS_PER_SHARED_STREAM: int = 10
     CHANGE_BUFFER_CHUNKS: int = 100
 

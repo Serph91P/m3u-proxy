@@ -396,8 +396,10 @@ class TranscodeCreateRequest(BaseModel):
 
 # Global stream manager and event manager
 redis_config = get_redis_config()
-redis_url = redis_config.get("redis_url") if should_use_pooling() else None
 enable_pooling = should_use_pooling()
+redis_url = (
+    redis_config.get("redis_url") if settings.REDIS_ENABLED and enable_pooling else None
+)
 
 stream_manager = StreamManager(redis_url=redis_url, enable_pooling=enable_pooling)
 event_manager = EventManager()
@@ -669,7 +671,7 @@ async def get_info():
     Includes hardware acceleration status, Redis pooling, transcoding profiles, and other details.
     """
     redis_config = get_redis_config()
-    use_pooling = should_use_pooling()
+    use_pooling = should_use_pooling() and settings.REDIS_ENABLED
     profile_manager = get_profile_manager()
 
     # Build the info response
