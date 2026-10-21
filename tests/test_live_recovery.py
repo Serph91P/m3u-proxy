@@ -199,22 +199,25 @@ async def test_same_url_reconnect_also_ends_body(manager, monkeypatch):
 async def test_timeout_selected_once_not_cb_or_eof(
     manager, monkeypatch, enabled, resolver
 ):
-    # Arm the tiny breaker only once the two expected packets were delivered.
-    # A busy runner may otherwise exceed 1 ms during initial setup and fire the
-    # breaker before this test reaches the timeout classification it exercises.
-    monkeypatch.setattr(settings, "STRICT_LIVE_TS_CIRCUIT_BREAKER_TIMEOUT", 3600)
+    # Keep setup/packet delivery outside the simulated no-data interval. Slow
+    # runners must not trip the 1 ms breaker before the timeout under test.
+    from datetime import datetime as RealDateTime, timedelta
+    import stream_manager as stream_module
 
-    async def primary():
-        yield b"A"
-        yield b"A"
-        monkeypatch.setattr(settings, "STRICT_LIVE_TS_CIRCUIT_BREAKER_TIMEOUT", 0.001)
-        await asyncio.Event().wait()
+    clock = [RealDateTime.now(stream_module.timezone.utc)]
 
+    class Clock(RealDateTime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    monkeypatch.setattr(stream_module, "datetime", Clock)
+    monkeypatch.setattr(settings, "STRICT_LIVE_TS_CIRCUIT_BREAKER_TIMEOUT", 0.001)
     opened, _ = sources(
         monkeypatch,
         manager,
         {
-            A: primary,
+            A: lambda: chunks(hang=True),
             B: lambda: chunks(b"B"),
             C: lambda: chunks(b"C"),
         },
@@ -231,6 +234,7 @@ async def test_timeout_selected_once_not_cb_or_eof(
 
     async def select(stream_id, reason):
         reasons.append(reason)
+        clock[0] += timedelta(seconds=1)
         manager.streams[sid].current_url = B if len(reasons) == 1 else C
         return True
 
