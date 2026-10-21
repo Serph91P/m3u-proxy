@@ -275,6 +275,8 @@ class StreamCreateRequest(BaseModel):
     # Seconds to retry the same URL before failover on a live silent close
     # (None = use the LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS ENV default, 0 = off)
     silent_close_retry_window: Optional[float] = None
+    end_session_on_reconnect: Optional[bool] = None
+    single_recovery_per_exit: Optional[bool] = None
 
     @field_validator("url")
     @classmethod
@@ -782,6 +784,8 @@ async def create_stream(request: StreamCreateRequest):
             silence_failover_threshold=request.silence_failover_threshold,
             silence_monitoring_grace_period=request.silence_monitoring_grace_period,
             silent_close_retry_window=request.silent_close_retry_window,
+            end_session_on_reconnect=request.end_session_on_reconnect,
+            single_recovery_per_exit=request.single_recovery_per_exit,
         )
 
         # Determine the appropriate endpoint based on stream type
@@ -830,6 +834,8 @@ async def create_stream(request: StreamCreateRequest):
             response["metadata"] = request.metadata
 
         return response
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating stream: {e}")
         raise HTTPException(status_code=500, detail=str(e))

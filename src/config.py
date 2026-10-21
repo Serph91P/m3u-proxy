@@ -159,6 +159,9 @@ class Settings(BaseSettings):
     # seconds of that retry, fail over as before. 0 (default) disables the same-URL
     # retry; m3u-editor can enable it per stream with silent_close_retry_window.
     LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS: float = 0.0
+    # Direct live only; downstream must explicitly request a new HTTP session.
+    LIVE_END_SESSION_ON_RECONNECT: bool = False
+    LIVE_SINGLE_RECOVERY_PER_EXIT: bool = False
 
     # Overlap trimming on silent reconnect (Strict Live TS Mode only).
     # Providers that close periodically usually restart from their rolling buffer,
