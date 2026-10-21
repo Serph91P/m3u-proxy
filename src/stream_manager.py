@@ -100,6 +100,9 @@ class StreamInfo:
     headers: Dict[str, str] = field(default_factory=dict)
     # Transcoding configuration
     is_transcoded: bool = False
+    # Server-assigned ownership, never hydrated from request metadata.
+    normalization_parent_id: Optional[str] = None
+    normalization_input_id: Optional[str] = None
     transcode_profile: Optional[str] = None
     transcode_ffmpeg_args: List[str] = field(default_factory=list)
     transcode_process: Optional[asyncio.subprocess.Process] = None
@@ -421,6 +424,7 @@ class ShieldedUpstreamReader:
 class StreamManager:
     def __init__(self, redis_url: Optional[str] = None, enable_pooling: bool = True):
         self.streams: Dict[str, StreamInfo] = {}
+        self._normalization_lock = asyncio.Lock()
         self.clients: Dict[str, ClientInfo] = {}
         self.stream_clients: Dict[str, Set[str]] = {}
         self.client_timeout = settings.CLIENT_TIMEOUT
@@ -541,6 +545,11 @@ class StreamManager:
 
     async def _emit_event(self, event_type: str, stream_id: str, data: dict):
         """Helper method to emit events if event manager is available"""
+        stream = self.streams.get(stream_id)
+        if stream and stream.normalization_parent_id:
+            if event_type != "FAILOVER_TRIGGERED":
+                return
+            stream_id = stream.normalization_parent_id
         if self.event_manager:
             try:
                 from models import StreamEvent, EventType
@@ -744,6 +753,7 @@ class StreamManager:
         silent_close_retry_window: Optional[float] = None,
         end_session_on_reconnect: Optional[bool] = None,
         single_recovery_per_exit: Optional[bool] = None,
+        identity_salt: Optional[str] = None,
     ) -> str:
         """Get or create a stream and return its ID
 
@@ -819,6 +829,17 @@ class StreamManager:
             stream_id = hashlib.md5(
                 f"{stream_id}|live-recovery|{int(end_session)}|{int(single_recovery)}".encode()
             ).hexdigest()
+
+        # Private composition identities must never expose the raw input.
+        if identity_salt:
+            stream_id = hashlib.md5(f"{stream_id}|{identity_salt}".encode()).hexdigest()
+
+        existing = self.streams.get(stream_id)
+        if existing and (
+            existing.normalization_input_id or existing.normalization_parent_id
+        ):
+            existing.last_access = datetime.now(timezone.utc)
+            return stream_id
 
         # If the stream exists but has no active clients, it's orphaned from a
         # previous session.  Delete it so we get a fresh StreamInfo below —
@@ -5611,6 +5632,47 @@ class StreamManager:
         for client_id in inactive_clients:
             await self.cleanup_client(client_id)
 
+    def normalization_source(self, stream: StreamInfo) -> StreamInfo:
+        inner = self.streams.get(stream.normalization_input_id)
+        if inner and inner.normalization_parent_id == stream.stream_id:
+            return inner
+        return stream
+
+    def normalization_stats(self, stream: StreamInfo) -> Dict:
+        source = self.normalization_source(stream)
+        if source is stream:
+            return {}
+        return {
+            "original_url": source.original_url,
+            "current_url": source.current_url,
+            "has_failover": bool(source.failover_urls or source.failover_resolver_url),
+            "failover_urls": source.failover_urls,
+            "failover_resolver_url": source.failover_resolver_url,
+            "current_failover_index": source.current_failover_index,
+            "failover_attempts": source.failover_attempts,
+            "last_failover_time": source.last_failover_time.isoformat()
+            if source.last_failover_time
+            else None,
+            "normalization_input_stream_id": source.stream_id,
+        }
+
+    async def cleanup_normalization_input(self, outer: StreamInfo):
+        """Delete only the input whose reciprocal ownership matches this outer."""
+        inner = self.normalization_source(outer)
+        if inner is outer:
+            return
+        for client_id in list(self.stream_clients.get(inner.stream_id, set())):
+            await self.cleanup_client(client_id)
+        handoff = self._handoff_upstream.pop(inner.stream_id, None)
+        if handoff:
+            await handoff[0].__aexit__(None, None, None)
+        self._direct_broadcast_primary.pop(inner.stream_id, None)
+        self._direct_broadcast_queues.pop(inner.stream_id, None)
+        self._handoff_settled.pop(inner.stream_id, None)
+        self.stream_clients.pop(inner.stream_id, None)
+        self.streams.pop(inner.stream_id, None)
+        self._stats.active_streams = max(0, self._stats.active_streams - 1)
+
     async def _cleanup_inactive_streams(self):
         """Clean up streams with no active clients"""
         current_time = datetime.now(timezone.utc)
@@ -5618,6 +5680,8 @@ class StreamManager:
 
         for stream_id, stream_info in self.streams.items():
             # Count only ACTIVE clients for this stream
+            if stream_info.normalization_parent_id in self.streams:
+                continue
             active_client_count = 0
             if stream_id in self.stream_clients:
                 for client_id in self.stream_clients[stream_id]:
@@ -5680,6 +5744,9 @@ class StreamManager:
                             "metadata": stream_info.metadata,
                         },
                     )
+
+                # Owned input cleanup is part of the public encoder lifecycle.
+                await self.cleanup_normalization_input(stream_info)
 
                 # Clean up broadcast state (may be stale if primary's
                 # finally block didn't run or _signal_subscribers_end missed).
@@ -5796,7 +5863,9 @@ class StreamManager:
         """Get comprehensive stats - aggregates variant stream stats into parent streams"""
         # Only count non-variant streams
         non_variant_streams = [
-            s for s in self.streams.values() if not s.is_variant_stream
+            s
+            for s in self.streams.values()
+            if not s.is_variant_stream and not s.normalization_parent_id
         ]
 
         # Build a map of aggregated stats for parent streams
@@ -5867,16 +5936,22 @@ class StreamManager:
             and stream.is_active
         )
 
-        # Count only connected clients
-        active_client_count = sum(
-            1 for client in self.clients.values() if client.is_connected
-        )
+        public_clients = [
+            client
+            for client in self.clients.values()
+            if not (
+                client.stream_id in self.streams
+                and self.streams[client.stream_id].normalization_parent_id
+            )
+        ]
+        # Do not count the encoder's loopback input as another viewer.
+        active_client_count = sum(1 for client in public_clients if client.is_connected)
 
         return {
             "proxy_stats": {
                 "total_streams": len(non_variant_streams),
                 "active_streams": active_stream_count,
-                "total_clients": len(self.clients),
+                "total_clients": len(public_clients),
                 "active_clients": active_client_count,
                 "total_bytes_served": self._stats.total_bytes_served,
                 "total_segments_served": self._stats.total_segments_served,
@@ -5925,6 +6000,7 @@ class StreamManager:
                     "headers": stream.headers,
                     "media_info": self._get_media_info(stream),
                     "output_media_info": self._get_output_media_info(stream),
+                    **self.normalization_stats(stream),
                 }
                 for stream in non_variant_streams
             ],
@@ -5941,7 +6017,7 @@ class StreamManager:
                     "last_access": client.last_access.isoformat(),
                     "is_connected": client.is_connected,
                 }
-                for client in self.clients.values()
+                for client in public_clients
                 if client.is_connected  # Only include connected clients
             ],
         }

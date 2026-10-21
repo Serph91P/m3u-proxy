@@ -1,5 +1,102 @@
 # Opt-in direct-live recovery
 
+## Persistent normalized output (separate, default-off opt-in)
+
+For players that **do not reconnect** when a live HTTP body ends, the existing
+`POST /streams` API can compose a private direct-live input with the existing
+pooled FFmpeg transcoder. No manual inner `/streams` + `/transcode` creation, URL
+rewrite, second player GET, or operator action is needed for automatic failover.
+
+Prerequisites (one process/instance, FFmpeg with libx264/AAC):
+
+```dotenv
+REDIS_ENABLED=false
+ENABLE_TRANSCODING_POOLING=true
+ENABLE_SINGLE_PROCESS_TRANSCODING=true
+LIVE_NORMALIZE_OUTPUT=false
+```
+
+```http
+POST /streams
+Content-Type: application/json
+
+{
+  "url": "http://source.example/live/channel.ts",
+  "failover_urls": ["http://backup.example/live/channel.ts"],
+  "normalize_live_output": true,
+  "metadata": {"id": "123", "original_channel_id": "123", "playlist_uuid": "provider"}
+}
+```
+
+Consume the returned `/stream/{stream_id}` normally. Nullable
+`normalize_live_output` inherits `LIVE_NORMALIZE_OUTPUT` (default `false`);
+explicit `false` overrides global `true`. Disabled mode keeps legacy identities
+and behavior. Redis, known multi-worker topologies, disabled local pooling,
+DASH/HLS/VOD inputs and missing ASGI server-port information are rejected before
+allocation. Replicas/external prefork deployments are not supported even if they
+cannot be detected. URL shape is validated without provider probing; sources and
+resolver-returned backups must actually be compatible direct live MPEG-TS.
+
+The owned input uses strict-live + sticky sessions, `single_recovery_per_exit=true`
+and **`end_session_on_reconnect=false`**, irrespective of those input request
+flags: its continuous raw TS body feeds one persistent normalizer. Ending the
+chunked input body at a source switch can make FFmpeg stop instead of reconnect.
+Existing handoff/source-selection behavior is reused, not replaced. Original
+metadata, upstream headers, failover resolver and silence settings reach the
+private input. Public metadata is original metadata plus
+`normalize_live_output="true"`; no `transcoding="true"` marker is injected, so
+ordinary-direct editor pooling can still find it.
+
+Only the outer ID is needed for management. `POST /streams/{id}/failover` routes
+to its owned input without restarting FFmpeg; listing, metadata search/counts and
+stream detail expose one provider stream and the input's current source/failover
+attempts, not the loopback URL. An optional diagnostic
+`normalization_input_stream_id` identifies the private source. Internal client
+and lifecycle webhooks do not count a second provider/viewer; source failover is
+reported against the public outer ID. Ownership is private server state, never a
+client-supplied metadata flag. Policy/profile-salted private IDs prevent ordinary
+raw clients from accidentally joining the normalizer's input. Repeated identical
+POSTs retain the active encoder and selected backup. GET activity holds the
+owned input; deleting/expiring the outer cascades only to its owned input.
+Cancellation/partial creation failures roll back new allocations.
+
+The CPU profile decodes compatible audio/video into 25 fps H.264/AAC MPEG-TS,
+normalizing timestamp discontinuities with the existing FFmpeg pipeline. This
+costs latency/CPU and changes bytes/codecs/quality. It is **not a claim of arbitrary
+codec, track-layout, resolution or protocol switching**; audio and video tracks
+are required. HLS/DASH/VOD remain outside this feature. Repeated failures still
+follow existing retry/exhaustion behavior and may eventually terminate playback.
+
+Optional trusted `LIVE_NORMALIZE_PROFILE` overrides the default below; required
+placeholders are `{input_url}` and `{output_args}`, with optional `{format}`.
+Changing the profile creates an isolated stream policy/ID; it does not modify
+already-running encoders. Keep a persistent MPEG-TS pipe output and test any
+customizations offline before using them.
+
+```text
+-analyzeduration 1000000 -probesize 1000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2 -reconnect_max_retries 5 -fflags +genpts+discardcorrupt -merge_pmt_versions 1 -dts_delta_threshold 1 -i {input_url} -map 0:v:0 -map 0:a:0 -vf fps=25 -af aresample=async=1:first_pts=0 -c:v libx264 -preset ultrafast -tune zerolatency -threads 2 -g 25 -bf 0 -c:a aac -b:a 128k -f mpegts {output_args}
+```
+
+Offline acceptance (installed project dependencies; no providers or Emby needed):
+
+```sh
+python -m pytest tests/test_live_normalization.py -q
+python tools/verify_live_normalization.py
+```
+
+The acceptance uses one initial API POST and **one player GET**, faults A's real
+HTTP body, then observes B's red→blue/440→880 Hz media in that same response.
+Both sources use H.264/AAC, with different PIDs and reset timestamps. It checks
+all decoded video frames, head/tail audio, zero backwards per-stream DTS, one
+provider count/current source and DELETE reader cleanup. A separate default-off
+control proves byte-exact direct delivery without a normalizer. FFmpeg decoder
+warnings from the deliberately truncated final capture are included in output;
+no claim of warning-free packet truncation or installed-client acceptance is made.
+For rollback, set `normalize_live_output=false`, consume that returned endpoint,
+and delete the owned normalized stream; global changes require restart/recreation.
+
+## Session-end recovery (independent options)
+
 These independent options are **disabled by default**. They apply to direct live
 HTTP streams, not VOD/timeshift, transcoding, HLS playlists or DASH manifests.
 Existing TS discontinuity-marker and overlap-trimming behavior is unchanged with

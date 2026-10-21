@@ -84,6 +84,19 @@ class Settings(BaseSettings):
     ENABLE_TRANSCODING_POOLING: bool = True
     # Opt in to the existing local FFmpeg manager without Redis; one process only.
     ENABLE_SINGLE_PROCESS_TRANSCODING: bool = False
+    # Persistent output normalizer for direct live MPEG-TS only (CPU encoding).
+    LIVE_NORMALIZE_OUTPUT: bool = False
+    LIVE_NORMALIZE_PROFILE: str = (
+        "-analyzeduration 1000000 -probesize 1000000 "
+        "-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 "
+        "-reconnect_delay_max 2 -reconnect_max_retries 5 "
+        "-fflags +genpts+discardcorrupt -merge_pmt_versions 1 "
+        "-dts_delta_threshold 1 -i {input_url} "
+        "-map 0:v:0 -map 0:a:0 -vf fps=25 "
+        "-af aresample=async=1:first_pts=0 "
+        "-c:v libx264 -preset ultrafast -tune zerolatency -threads 2 "
+        "-g 25 -bf 0 -c:a aac -b:a 128k -f mpegts {output_args}"
+    )
     MAX_CLIENTS_PER_SHARED_STREAM: int = 10
     CHANGE_BUFFER_CHUNKS: int = 100
 
