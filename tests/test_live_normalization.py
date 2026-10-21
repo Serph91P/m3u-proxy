@@ -315,6 +315,64 @@ async def test_private_profile_policy_id_and_ownership_not_metadata(
 
 
 @pytest.mark.asyncio
+async def test_owned_input_delete_rejected_without_disrupting_outer(manager, monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(settings, "API_TOKEN", "offline-fixture-only")
+    stop = AsyncMock()
+    monkeypatch.setattr(manager.pooled_manager, "force_stop_stream", stop)
+    transport = httpx.ASGITransport(app=api.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://fixture.invalid:12345",
+        headers={"X-API-Token": "offline-fixture-only"},
+    ) as client:
+        raw = await api.create_stream(payload(), scope())
+        unrelated = manager.streams[raw["stream_id"]]
+        await manager.register_client("unrelated", unrelated.stream_id, "test", "127.0.0.1")
+        created = await client.post(
+            "/streams", json=payload(normalize_live_output=True).model_dump()
+        )
+        assert created.status_code == 200
+        outer = manager.streams[created.json()["stream_id"]]
+        inner = manager.normalization_source(outer)
+        outer.transcode_stream_key = "owned-encoder-key"
+        await manager.register_client("viewer", outer.stream_id, "test", "127.0.0.1")
+        await manager.register_client("encoder", inner.stream_id, "ffmpeg", "127.0.0.1")
+        streams_before = dict(manager.streams)
+        clients_before = dict(manager.clients)
+        stats_before = manager._stats.active_streams
+
+        rejected = await client.delete(f"/streams/{inner.stream_id}")
+        assert rejected.status_code == 409
+        assert manager.streams == streams_before
+        assert manager.clients == clients_before
+        assert manager._stats.active_streams == stats_before
+        assert manager.normalization_source(outer) is inner
+        assert outer.transcode_stream_key == "owned-encoder-key"
+        assert not inner.stream_stopped_emitted
+        assert not outer.stream_stopped_emitted
+        stop.assert_not_awaited()
+
+        switched = await client.post(f"/streams/{outer.stream_id}/failover")
+        assert switched.status_code == 200
+        assert switched.json()["new_url"].endswith("/b.ts")
+        assert inner.current_url.endswith("/b.ts")
+        assert inner.failover_attempts == 1
+        assert manager.streams[unrelated.stream_id] is unrelated
+        assert unrelated.current_url == unrelated.original_url
+        assert outer.transcode_stream_key == "owned-encoder-key"
+        stop.assert_not_awaited()
+
+        deleted = await client.delete(f"/streams/{outer.stream_id}")
+        assert deleted.status_code == 200
+        stop.assert_awaited_once_with("owned-encoder-key")
+        assert manager.streams == {unrelated.stream_id: unrelated}
+        assert set(manager.clients) == {"unrelated"}
+        assert manager.stream_clients[unrelated.stream_id] == {"unrelated"}
+
+
+@pytest.mark.asyncio
 async def test_native_http_stream_control_contract(manager, monkeypatch):
     import httpx
 

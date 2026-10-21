@@ -2532,6 +2532,11 @@ async def delete_stream(stream_id: str):
             raise HTTPException(status_code=404, detail="Stream not found")
 
         stream_info = stream_manager.streams[stream_id]
+        if stream_info.normalization_parent_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Owned normalization input cannot be deleted directly; delete its parent stream",
+            )
 
         # For transcoded streams, force stop the FFmpeg process immediately
         if stream_info.is_transcoded and stream_manager.pooled_manager:

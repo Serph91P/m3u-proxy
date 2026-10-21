@@ -297,8 +297,17 @@ def main():
                         capture.open("wb") as output,
                     ):
                         response.raise_for_status()
+                        input_delete_status = None
                         for chunk in response.iter_bytes():
                             output.write(chunk)
+                            if input_delete_status is None:
+                                active = client.get(f"/streams/{outer_id}").json()["stream"]
+                                inner_id = active["normalization_input_stream_id"]
+                                rejected = client.delete(f"/streams/{inner_id}")
+                                input_delete_status = rejected.status_code
+                                assert input_delete_status == 409, rejected.text
+                                retained = client.get(f"/streams/{outer_id}").json()["stream"]
+                                assert retained["normalization_input_stream_id"] == inner_id
                             if time.monotonic() - started >= 24:
                                 break
                         else:
@@ -326,6 +335,7 @@ def main():
                         initial_posts=1,
                         source_requests=list(requests),
                         failover_attempts=info["failover_attempts"],
+                        owned_input_delete_status=input_delete_status,
                     )
                     client.delete(f"/streams/{outer_id}").raise_for_status()
                     for _ in range(100):
