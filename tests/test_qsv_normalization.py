@@ -56,6 +56,27 @@ async def test_qsv_private_ids_pool_reuse_and_server_owned_profile(manager, monk
 
 
 @pytest.mark.asyncio
+async def test_qsv_serializes_only_software_input_decoder(manager, monkeypatch):
+    """Strict H.264 join recovery must not enter FFmpeg's frame-thread loop."""
+    monkeypatch.setattr(normalization, "validate_vaapi_encoder", AsyncMock())
+    monkeypatch.setattr(normalization, "validate_qsv_encoder", AsyncMock())
+    for encoder in ("cpu", "vaapi", "qsv"):
+        result = await api.create_stream(payload(
+            normalize_live_output=True, normalization_encoder=encoder), scope())
+        args = manager.streams[result["stream_id"]].transcode_ffmpeg_args
+        input_at = args.index("-i")
+        if encoder == "qsv":
+            assert args[:input_at].count("-threads:v") == 1
+            assert args[args.index("-threads:v") + 1] == "1"
+            assert "-threads:v" not in args[input_at:]
+            assert args[args.index("-hwaccel") + 1] == "none"
+            assert args[args.index("-err_detect:v") + 1] == "explode"
+            assert args[args.index("-ec:v") + 1] == "0"
+        else:
+            assert "-threads:v" not in args
+
+
+@pytest.mark.asyncio
 async def test_qsv_off_does_not_probe_or_change_direct_id(manager, monkeypatch):
     probe = AsyncMock(side_effect=AssertionError("off must not probe GPU"))
     monkeypatch.setattr(normalization, "validate_qsv_encoder", probe)
@@ -119,7 +140,7 @@ async def test_qsv_admission_exercises_exact_static_software_decode_qsv_encode_p
     assert generator[generator.index("-c:v") + 1] == "libx264"
     assert "tff=1" in generator and "18" in generator
     template = shlex.split(normalization.QSV_PROFILE)
-    for option in ("-hwaccel", "-err_detect:v", "-ec:v", "-fflags", "-vf", "-c:v", "-global_quality", "-enc_time_base", "-bf"):
+    for option in ("-hwaccel", "-err_detect:v", "-ec:v", "-threads:v", "-fflags", "-vf", "-c:v", "-global_quality", "-enc_time_base", "-bf"):
         assert hardware[hardware.index(option) + 1] == template[template.index(option) + 1]
     assert hardware[hardware.index("-hwaccel") + 1] == "none"
     assert "-hwaccel_output_format" not in hardware

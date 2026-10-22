@@ -44,7 +44,12 @@ QSV_DEVICE_ARGS = (
     "-init_hw_device", "vaapi=va:/dev/dri/renderD128",
     "-init_hw_device", "qsv=qs@va", "-filter_hw_device", "qs",
 )
-QSV_DECODING_ARGS = ("-hwaccel", "none", "-err_detect:v", "explode", "-ec:v", "0")
+# Strict H.264 recovery can loop on an initial broken access unit with frame
+# threading. Serialize only this software input decoder, not the QSV encoder.
+QSV_DECODING_ARGS = (
+    "-hwaccel", "none", "-err_detect:v", "explode", "-ec:v", "0",
+    "-threads:v", "1",
+)
 QSV_FILTER = (
     "bwdif=mode=send_field:parity=auto:deint=interlaced,"
     "format=nv12,hwupload=extra_hw_frames=64"
