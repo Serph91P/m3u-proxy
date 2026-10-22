@@ -7,7 +7,9 @@ supported program; ``finish()`` validates EOF. Errors are terminal: caller must
 end the owned input, not fall back to forwarding raw bytes. No auto-detection
 of generation boundaries, timestamp repair, codec conversion or DRM support.
 
-Scope: exactly one H.264 video + AAC ADTS (0x0f) or AC-3 (0x81) audio program.
+Scope: exactly one H.264 video + AAC ADTS (0x0f) or AC-3 (0x81 / DVB 0x06)
+audio program. DVB private PES must identify AC-3 via descriptor 0x6a or
+registration 'AC-3'; unrecognized private PES and E-AC-3 fail closed.
 The audio type, PCR role and admitted descriptors must match across generations.
 Only selected elementary/PCR packets are forwarded; ancillary SI/null/unknown
 PIDs are discarded, not converted. PAT/PMT are regenerated with stable program,
@@ -275,9 +277,25 @@ class TSCanonicalizer:
                 raise TSCanonicalizationError('truncated ES entry')
             kind, pid = table[offset], _pid(table, offset + 1)
             desc, offset = info(offset + 3)
+            if kind in (6, 129):
+                # DVB carries AC-3 as private PES (0x06), identified by
+                # descriptor 0x6a or registration 'AC-3'. Preserve that wire
+                # representation; never relabel arbitrary private PES / EAC3.
+                tags, registrations = set(), set()
+                at = 0
+                while at < len(desc):
+                    tag, size = desc[at:at + 2]
+                    tags.add(tag)
+                    if tag == 5:
+                        registrations.add(desc[at + 2:at + 6])
+                    at += 2 + size
+                if registrations - {b'AC-3'}:
+                    raise TSCanonicalizationError('unsupported audio registration')
+                if kind == 6 and 0x6A not in tags and b'AC-3' not in registrations:
+                    raise TSCanonicalizationError('private PES is not identified DVB AC3')
             streams.append((kind, pid, desc))
         video = [s for s in streams if s[0] == 27]
-        audio = [s for s in streams if s[0] in (15, 129)]
+        audio = [s for s in streams if s[0] in (6, 15, 129)]
         if len(streams) != 2 or len(video) != 1 or len(audio) != 1:
             raise TSCanonicalizationError('only one H264 + AAC/AC3 program supported')
         v, a = video[0], audio[0]

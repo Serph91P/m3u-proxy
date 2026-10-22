@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse
 
 from config import settings
 from ts_overlap import OverlapTrimmer, TRIM_MATCHED, TRIM_NO_MATCH
+from ts_canonicalizer import TSCanonicalizer
 
 logger = logging.getLogger(__name__)
 
@@ -1649,6 +1650,7 @@ class StreamManager:
         )
 
         async def _open_fresh_upstream():
+            nonlocal generation
             logger.info(
                 f"Promoted subscriber {client_id} opening new upstream connection "
                 f"for stream {stream_id} to {active_url}"
@@ -1664,6 +1666,9 @@ class StreamManager:
             except Exception:
                 await ctx.__aexit__(None, None, None)
                 raise
+            if self._is_qsv_owned_input(stream_info):
+                stream_info.direct_generation += 1
+                generation = stream_info.direct_generation
             logger.info(
                 f"Promoted primary connected: {resp.status_code} for stream {stream_id}"
             )
@@ -1831,7 +1836,60 @@ class StreamManager:
                 await self._end_direct_generation(stream_id, connection_id)
             self._signal_subscribers_end(stream_id, connection_id)
 
+    def _is_qsv_owned_input(self, stream_info: StreamInfo) -> bool:
+        """Only the reciprocal, server-created private input can opt in."""
+        outer = self.streams.get(stream_info.normalization_parent_id)
+        return bool(
+            outer is not None
+            and outer.normalization_input_id == stream_info.stream_id
+            and outer.metadata.get("normalization_encoder") == "qsv"
+        )
+
     async def stream_continuous_direct(
+        self, stream_id: str, client_id: str, range_header: Optional[str] = None
+    ) -> StreamingResponse:
+        response = await self._stream_continuous_direct_original(
+            stream_id, client_id, range_header
+        )
+        info = self.streams.get(stream_id)
+        if info is None or not self._is_qsv_owned_input(info):
+            return response
+
+        # Wrap the response, not just the primary generator: subscriber queues,
+        # promoted readers and seamless upstream handoffs all pass this boundary.
+        original = response.body_iterator
+
+        async def canonicalized():
+            adapter = TSCanonicalizer()
+            epoch = info.direct_generation
+            try:
+                async with aclosing(original):
+                    async for chunk in original:
+                        if self.streams.get(stream_id) is not info:
+                            return
+                        current_epoch = info.direct_generation
+                        if current_epoch != epoch:
+                            adapter.start_generation()
+                            epoch = current_epoch
+                        # The source generators fence stale reads BEFORE yielding.
+                        # No await between epoch inspection and feed.
+                        data = adapter.feed(chunk)
+                        if data:
+                            yield data
+                    # A transient upstream EOF is handled inside the original
+                    # generator; only terminal EOF validates the final fragment.
+                    tail = adapter.finish()
+                    if tail:
+                        yield tail
+            finally:
+                # aclosing above also runs for adapter failures / early close;
+                # never retry or fall back to unadapted source bytes here.
+                pass
+
+        response.body_iterator = canonicalized()
+        return response
+
+    async def _stream_continuous_direct_original(
         self, stream_id: str, client_id: str, range_header: Optional[str] = None
     ) -> StreamingResponse:
         """
@@ -1951,6 +2009,7 @@ class StreamManager:
 
         async def generate():
             """Generator that directly proxies bytes from provider to client with failover support"""
+            nonlocal generation
             nonlocal \
                 provider_status_code, \
                 provider_content_range, \
@@ -2186,6 +2245,15 @@ class StreamManager:
 
                         # Now we can call methods on the actual response object
                         response.raise_for_status()
+
+                        # QSV's private normalizer keeps one HTTP input across
+                        # source failures. A new successful upstream response is
+                        # a new TS identity epoch (not each output chunk).
+                        if generation != stream_info.direct_generation:
+                            raise _DirectGenerationEnded()
+                        if self._is_qsv_owned_input(stream_info):
+                            stream_info.direct_generation += 1
+                            generation = stream_info.direct_generation
 
                         # Capture provider response details for proper HTTP 206 handling
                         provider_status_code = response.status_code
