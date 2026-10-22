@@ -14,8 +14,11 @@ The audio type, PCR role and admitted descriptors must match across generations.
 Only selected elementary/PCR packets are forwarded; ancillary SI/null/unknown
 PIDs are discarded, not converted. PAT/PMT are regenerated with stable program,
 PMT/PCR/elementary PIDs and CRC. PES, timestamps, PCR bytes and adaptation payload
-are byte-exact; only TS header PID/continuity fields change. Continuous output
-CCs do NOT claim continuous clocks: FFmpeg still needs timestamp recovery.
+are byte-exact; only TS header PID/continuity fields change. Media CCs rebase
+at generation boundaries, but retain source modulo-16 deltas within a generation:
+loss gaps, duplicates and adaptation-only semantics survive, as do explicit
+discontinuity flags. Loss in exact multiples of 16 is unknowable from CC alone.
+Rebased CCs do NOT claim continuous clocks: FFmpeg still needs timestamp recovery.
 
 This is deliberately fail-closed, not a general TS remuxer. 192/204-byte packets,
 multi-program/multi-section tables, in-generation table changes, unknown or
@@ -168,6 +171,7 @@ class TSCanonicalizer:
         self._source_pat = self._source_pmt = None
         self._pmt_pid = self._program = None
         self._mapping = None
+        self._source_cc = {}
 
     def feed(self, data):
         self._check()
@@ -338,5 +342,15 @@ class TSCanonicalizer:
         target = self._mapping.get(pid)
         if target is None:
             return b''
+        source_cc = packet[3] & 15
+        previous = self._source_cc.get(pid)
+        if previous is None:
+            cc = self._next_cc(target, payload)
+        else:
+            # Rebase identity, not transport history: retain gaps, wrap and
+            # same-CC duplicates (including adaptation-only CC semantics).
+            cc = (self._cc[target] + source_cc - previous) % 16
+            self._cc[target] = cc
+        self._source_cc[pid] = source_cc
         return (bytes([packet[0], (packet[1] & 0xE0) | (target >> 8), target & 255,
-                       (packet[3] & 0xF0) | self._next_cc(target, payload)]) + packet[4:])
+                       (packet[3] & 0xF0) | cc]) + packet[4:])

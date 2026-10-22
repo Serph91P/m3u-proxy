@@ -216,6 +216,21 @@ def test_invalid_transport_headers(offset, value):
         TSCanonicalizer().feed(packet)
 
 
+@pytest.mark.parametrize('source_pid,target', [(512, 256), (513, 257)])
+def test_media_loss_survives_rebased_cc_and_wrap(source_pid, target):
+    c = TSCanonicalizer()
+    c.feed(packets(0, pat()) + packets(1256, pmt()))
+    source = [media(source_pid, value=i, cc=cc)
+              for i, cc in enumerate([13, 14, 1, 2, 2, 4])]
+    output = split(c.feed(b''.join(source)))
+    assert [pid(p) for p in output] == [target] * len(source)
+    # Missing 15/0 and missing 3 remain visible; same-CC different data is
+    # not falsely made continuous either. Initial source CC is arbitrary.
+    assert [p[3] & 15 for p in output] == [0, 1, 4, 5, 5, 7]
+    assert [p[4:] for p in output] == [p[4:] for p in source]
+    c.finish()
+
+
 def test_payload_and_adaptation_only_output_cc_rules():
     adaptation = bytes([0x47, 512 >> 8, 512 & 255, 0x28, 183, 0]) + b'\xff' * 182
     output = split(TSCanonicalizer().feed(fixture() + adaptation + media(512, cc=9)))
