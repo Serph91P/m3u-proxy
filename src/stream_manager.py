@@ -33,6 +33,33 @@ class _DirectGenerationEnded(Exception):
 
 
 @dataclass
+class _DirectInputRequest:
+    """State shared only by raw generators within one owned input response."""
+
+    max_attempts: int
+    closing_for_recovery: bool = False
+    attempts: int = 0
+    client: Optional["ClientInfo"] = None
+    connection_id: Optional[str] = None
+    cancel_event: Optional[asyncio.Event] = None
+
+    def is_active(self, clients, client_id) -> bool:
+        return self.connection_id is None or (
+            self.client is not None
+            and clients.get(client_id) is self.client
+            and self.client.active_connection_id == self.connection_id
+            and self.cancel_event is not None
+            and not self.cancel_event.is_set()
+        )
+
+    def reserve_failover(self) -> bool:
+        if self.attempts >= self.max_attempts:
+            return False
+        self.attempts += 1
+        return True
+
+
+@dataclass
 class ClientInfo:
     client_id: str
     created_at: datetime
@@ -1848,12 +1875,20 @@ class StreamManager:
     async def stream_continuous_direct(
         self, stream_id: str, client_id: str, range_header: Optional[str] = None
     ) -> StreamingResponse:
-        response = await self._stream_continuous_direct_original(
-            stream_id, client_id, range_header
-        )
         info = self.streams.get(stream_id)
         if info is None or not self._is_qsv_owned_input(info):
-            return response
+            return await self._stream_continuous_direct_original(
+                stream_id, client_id, range_header
+            )
+        configured_max = settings.MAX_FAILOVER_ATTEMPTS
+        request = _DirectInputRequest(
+            configured_max if configured_max > 0 else (
+                len(info.failover_urls) if info.failover_urls else 999
+            )
+        )
+        response = await self._stream_continuous_direct_original(
+            stream_id, client_id, range_header, _input_request=request
+        )
 
         # Wrap the response, not just the primary generator: subscriber queues,
         # promoted readers and seamless upstream handoffs all pass this boundary.
@@ -1868,17 +1903,17 @@ class StreamManager:
             source = original
             epoch = initial_epoch
             connection_id = initial_connection_id
-            attempts = 0
+            def request_is_active():
+                return request.is_active(self.clients, client_id)
+
             output_started = False
-            configured_max = settings.MAX_FAILOVER_ATTEMPTS
-            max_attempts = configured_max if configured_max > 0 else (
-                len(info.failover_urls) if info.failover_urls else 999
-            )
             while True:
                 adapter = TSCanonicalizer()
                 try:
                     async with aclosing(source):
                         try:
+                            if not request_is_active():
+                                return
                             async for chunk in source:
                                 if self.streams.get(stream_id) is not info:
                                     return
@@ -1901,7 +1936,8 @@ class StreamManager:
                             # outer stream). Never feed rejected bytes to the decoder.
                             async with info.direct_recovery_lock:
                                 if (
-                                    self.streams.get(stream_id) is not info
+                                    not request_is_active()
+                                    or self.streams.get(stream_id) is not info
                                     or not self._is_qsv_owned_input(info)
                                     or epoch != info.direct_generation
                                     or self._direct_broadcast_primary.get(stream_id)
@@ -1914,22 +1950,23 @@ class StreamManager:
                                 # late errors therefore end this input cleanly.
                                 if (
                                     not output_started
-                                    and attempts < max_attempts
                                     and (info.failover_resolver_url or info.failover_urls)
+                                    and request.reserve_failover()
                                 ):
-                                    attempts += 1
                                     recovered = await self._update_failover_url(
                                         stream_id, "normalization_input_error",
                                         expected_generation=epoch,
                                     )
                                 if (
-                                    self.streams.get(stream_id) is not info
+                                    not request_is_active()
+                                    or self.streams.get(stream_id) is not info
                                     or epoch != info.direct_generation
                                     or not self._is_qsv_owned_input(info)
                                 ):
                                     raise
                                 # Invalidate the rejected source before aclose can
                                 # promote subscribers or offer its upstream handoff.
+                                next_epoch = epoch + 1
                                 if (
                                     connection_id is not None
                                     and self._direct_broadcast_primary.get(stream_id)
@@ -1940,24 +1977,52 @@ class StreamManager:
                                     info.direct_generation += 1
                                 if not recovered:
                                     raise
+                                epoch = next_epoch
+                                if (
+                                    not request_is_active()
+                                    or self.streams.get(stream_id) is not info
+                                    or epoch != info.direct_generation
+                                    or not self._is_qsv_owned_input(info)
+                                    or self._direct_broadcast_primary.get(stream_id)
+                                    not in (None, connection_id)
+                                ):
+                                    raise
+                                # Closing this raw reader is a source replacement,
+                                # not a disconnect of the owning HTTP request.
+                                request.closing_for_recovery = True
                 finally:
-                    if connection_id is not None:
+                    reopening = request.closing_for_recovery
+                    request.closing_for_recovery = False
+                    if not reopening and connection_id is not None:
                         await self.cleanup_client(client_id, connection_id)
                 # The old upstream is closed before opening the selected candidate.
                 # Keep this HTTP response open and reset all adapter discovery state.
+                if (
+                    not request_is_active()
+                    or self.streams.get(stream_id) is not info
+                    or epoch != info.direct_generation
+                    or not self._is_qsv_owned_input(info)
+                    or self._direct_broadcast_primary.get(stream_id)
+                    not in (None, connection_id)
+                ):
+                    if connection_id is not None:
+                        await self.cleanup_client(client_id, connection_id)
+                    return
+                if connection_id is not None:
+                    self.connection_cancel_events.pop(connection_id, None)
                 next_response = await self._stream_continuous_direct_original(
-                    stream_id, client_id, range_header
+                    stream_id, client_id, range_header, _input_request=request
                 )
                 source = next_response.body_iterator
                 epoch = info.direct_generation
-                client = self.clients.get(client_id)
-                connection_id = client.active_connection_id if client else None
+                connection_id = request.connection_id
 
         response.body_iterator = canonicalized()
         return response
 
     async def _stream_continuous_direct_original(
-        self, stream_id: str, client_id: str, range_header: Optional[str] = None
+        self, stream_id: str, client_id: str, range_header: Optional[str] = None,
+        *, _input_request: Optional[_DirectInputRequest] = None,
     ) -> StreamingResponse:
         """
         Direct byte-for-byte proxy for continuous streams (.ts, .mp4, .mkv).
@@ -2001,6 +2066,36 @@ class StreamManager:
                 f"Client {client_id} now has active connection: {connection_id}"
             )
 
+        request_client = self.clients.get(client_id)
+        if _input_request is not None:
+            _input_request.client = request_client
+            _input_request.connection_id = connection_id
+            _input_request.cancel_event = cancel_event
+
+        def input_request_is_active():
+            return (
+                self.streams.get(stream_id) is stream_info
+                and generation == stream_info.direct_generation
+                and self._is_qsv_owned_input(stream_info)
+                and request_client is not None
+                and self.clients.get(client_id) is request_client
+                and request_client.active_connection_id == connection_id
+                and not cancel_event.is_set()
+            )
+
+        async def select_failover(selected_stream_id, reason):
+            if _input_request is None:
+                return await self._try_update_failover_url(selected_stream_id, reason)
+            # Transport and adapter selectors spend the same response budget.
+            # Recheck after lock acquisition; stale readers must not select again.
+            async with stream_info.direct_recovery_lock:
+                if not input_request_is_active() or not _input_request.reserve_failover():
+                    return False
+                recovered = await self._update_failover_url(
+                    selected_stream_id, reason, expected_generation=generation
+                )
+                return recovered and input_request_is_active()
+
         # --- Direct stream broadcasting (connection sharing) ---
         # For live (non-VOD) streams, if another client is already reading from upstream
         # for this stream_id, subscribe to its broadcast instead of opening a duplicate
@@ -2040,7 +2135,7 @@ class StreamManager:
                     stream_info.failover_resolver_url or stream_info.failover_urls
                 )
                 if has_failover:
-                    await self._try_update_failover_url(
+                    await select_failover(
                         stream_id, "circuit_breaker_bad_upstream"
                     )
                     current_url = stream_info.current_url or stream_info.original_url
@@ -2567,7 +2662,7 @@ class StreamManager:
                                                 f"(failover attempt {failover_count + 1}/{max_failovers})"
                                             )
                                             failover_ok = (
-                                                await self._try_update_failover_url(
+                                                await select_failover(
                                                     stream_id,
                                                     "chunk_timeout_after_retries",
                                                 )
@@ -2797,7 +2892,7 @@ class StreamManager:
                                                         f"Bitrate consistently below threshold for stream {stream_id}, "
                                                         f"triggering failover (attempt {failover_count + 1}/{max_failovers})"
                                                     )
-                                                    await self._try_update_failover_url(
+                                                    await select_failover(
                                                         stream_id, "low_bitrate"
                                                     )
                                                     # Reset bitrate monitoring for new connection
@@ -2913,7 +3008,7 @@ class StreamManager:
                                                         f"Persistent silence detected for stream {stream_id}, "
                                                         f"triggering failover (attempt {failover_count + 1}/{max_failovers})"
                                                     )
-                                                    await self._try_update_failover_url(
+                                                    await select_failover(
                                                         stream_id, "silence_detected"
                                                     )
                                                     silence_count = 0
@@ -3032,7 +3127,7 @@ class StreamManager:
                                     logger.info(
                                         "STRICT MODE: Attempting failover due to circuit breaker"
                                     )
-                                    failover_ok = await self._try_update_failover_url(
+                                    failover_ok = await select_failover(
                                         stream_id, "circuit_breaker_timeout"
                                     )
                                     failover_count += 1
@@ -3131,7 +3226,7 @@ class StreamManager:
                                     f"provider may have closed connection. "
                                     f"Attempting failover (attempt {failover_count + 1}/{max_failovers})"
                                 )
-                                failover_ok = await self._try_update_failover_url(
+                                failover_ok = await select_failover(
                                     stream_id, "live_stream_silent_close"
                                 )
                                 failover_count += 1
@@ -3243,6 +3338,8 @@ class StreamManager:
                         raise
 
                     except GeneratorExit:
+                        if _input_request and _input_request.closing_for_recovery:
+                            return
                         # Client disconnected — Starlette throws GeneratorExit into the
                         # async generator when the HTTP connection closes.  Without this
                         # handler, GeneratorExit (a BaseException) propagates through the
@@ -3374,7 +3471,7 @@ class StreamManager:
                                 logger.info(
                                     f"Retries exhausted, attempting automatic failover for client {client_id} (ReadError, no data)"
                                 )
-                                failover_ok = await self._try_update_failover_url(
+                                failover_ok = await select_failover(
                                     stream_id, "connection_error_after_retries"
                                 )
                                 failover_count += 1
@@ -3578,7 +3675,7 @@ class StreamManager:
                                 f"Retries exhausted, attempting automatic failover for client {client_id} "
                                 f"(failover attempt {failover_count + 1}/{max_failovers})"
                             )
-                            failover_ok = await self._try_update_failover_url(
+                            failover_ok = await select_failover(
                                 stream_id,
                                 f"stream_error_{type(e).__name__}_after_retries",
                             )
@@ -3759,7 +3856,7 @@ class StreamManager:
                                 logger.info(
                                     f"Retries exhausted, attempting automatic failover for client {client_id} (unknown error)"
                                 )
-                                failover_ok = await self._try_update_failover_url(
+                                failover_ok = await select_failover(
                                     stream_id,
                                     f"unknown_error_{type(e).__name__}_after_retries",
                                 )

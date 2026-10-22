@@ -179,7 +179,7 @@ async def test_finish_failure_selects_next_candidate(manager, monkeypatch):
         finally:
             closed.append(url)
 
-    async def original(stream_id, client_id, range_header):
+    async def original(stream_id, client_id, range_header, **kwargs):
         url = manager.streams[sid].current_url or A
         opened.append(url)
         return StreamingResponse(source(url))
