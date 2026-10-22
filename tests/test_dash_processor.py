@@ -1,4 +1,5 @@
 from stream_manager import DashProcessor
+from url_signing import sign_url
 import logging
 
 import sys
@@ -98,9 +99,9 @@ class TestDashProcessorBaseUrlRewriting:
         assert "http://proxy.com/dash/stream123/segment/cid-1/" in result
         assert "<BaseURL>" in result
 
-        encoded = result.split("/segment/cid-1/", 1)[1].split("/", 1)[0]
+        token = result.split("/segment/cid-1/", 1)[1].split("/", 1)[0]
         assert (
-            DashProcessor.decode_base(encoded)
+            DashProcessor.verify_base(token)
             == "https://upstream.example.com/live/dash/"
         )
 
@@ -119,10 +120,8 @@ class TestDashProcessorBaseUrlRewriting:
         )
 
         assert "<BaseURL>http://proxy.com/dash/stream123/segment/cid-1/" in result
-        encoded = result.split("/segment/cid-1/", 1)[1].split("/", 1)[0]
-        assert (
-            DashProcessor.decode_base(encoded) == "https://upstream.example.com/live/"
-        )
+        token = result.split("/segment/cid-1/", 1)[1].split("/", 1)[0]
+        assert DashProcessor.verify_base(token) == "https://upstream.example.com/live/"
 
     def test_multi_period_rewrites_each_period_baseurl_independently(self):
         processor = DashProcessor("http://proxy.com/dash/stream123", "cid-1")
@@ -134,7 +133,7 @@ class TestDashProcessorBaseUrlRewriting:
         )
 
         bases = [
-            DashProcessor.decode_base(chunk.split("/", 1)[0])
+            DashProcessor.verify_base(chunk.split("/", 1)[0])
             for chunk in result.split("http://proxy.com/dash/stream123/segment/cid-1/")[
                 1:
             ]
@@ -271,7 +270,7 @@ class TestDashSegmentRoutes:
     def test_segment_route_registers_path_client_and_proxies(self):
         client, mock, patcher = self._make()
         try:
-            enc = DashProcessor.encode_base("https://upstream.example.com/live/dash/")
+            enc = DashProcessor.sign_base("https://upstream.example.com/live/dash/")
             resp = client.get(f"/dash/stream123/segment/tab-B/{enc}/chunk-1.m4s")
 
             assert resp.status_code == 200
@@ -287,7 +286,7 @@ class TestDashSegmentRoutes:
     def test_pooled_viewers_are_billed_separately_by_their_path_client_id(self):
         client, mock, patcher = self._make()
         try:
-            enc = DashProcessor.encode_base("https://upstream.example.com/live/")
+            enc = DashProcessor.sign_base("https://upstream.example.com/live/")
             client.get(f"/dash/stream123/segment/tab-A/{enc}/s.m4s")
             billed_a = mock.proxy_dash_segment.call_args.args[1]
             client.get(f"/dash/stream123/segment/tab-B/{enc}/s.m4s")
@@ -305,6 +304,7 @@ class TestDashSegmentRoutes:
                 params={
                     "client_id": "tab-777",
                     "url": "https://upstream.example.com/video/seg1.m4s",
+                    "sig": sign_url("https://upstream.example.com/video/seg1.m4s"),
                 },
             )
 

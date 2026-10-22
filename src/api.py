@@ -13,6 +13,7 @@ from typing import Optional, List, Dict, Literal
 from pydantic import BaseModel, field_validator
 from datetime import datetime, timezone
 import os
+import platform
 
 from stream_manager import StreamManager, DashProcessor
 from events import EventManager
@@ -22,6 +23,7 @@ from transcoding import get_profile_manager
 from redis_config import get_redis_config, should_use_pooling
 from hwaccel import hw_accel
 from broadcast_manager import BroadcastManager, BroadcastConfig
+from url_signing import verify_url
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -679,6 +681,7 @@ async def get_info():
     # Build the info response
     info = {
         "version": VERSION,
+        "python_version": platform.python_version(),
         "ffmpeg_version": get_ffmpeg_version(),
         "streamlink_version": get_resolver_version("streamlink")
         if settings.STREAMLINK_ENABLED
@@ -737,15 +740,26 @@ async def resolve_stream_id(
     parent: Optional[str] = Query(
         None, description="Parent stream ID (for variant playlists)"
     ),
+    sig: Optional[str] = Query(
+        None, description="Signature the proxy adds to rewritten variant playlist URLs"
+    ),
+    x_api_token: Optional[str] = Header(None, alias="X-API-Token"),
+    api_token: Optional[str] = Query(None),
 ) -> str:
     """
     Dependency to get a stream_id. If a URL is provided in the query,
     it will be used to create/retrieve a stream, overriding the path stream_id.
     Also validates that the stream exists.
 
+    A URL is only accepted when it carries the signature the proxy added while
+    rewriting a variant playlist, or when the request passes verify_token.
+    Otherwise this would be an unauthenticated fetch of any URL.
+
     If parent is provided, the created stream will be marked as a variant of the parent.
     """
     if url:
+        if not verify_url(url, sig):
+            await verify_token(x_api_token, api_token)
         try:
             decoded_url = unquote(url)
             validate_url(decoded_url)
@@ -1290,8 +1304,15 @@ async def get_hls_segment(
     request: Request,
     client_id: str = Query(..., description="Client ID"),
     url: str = Query(..., description="The segment URL to proxy"),
+    sig: Optional[str] = Query(
+        None, description="Signature from the rewritten playlist"
+    ),
 ):
     """Proxy HLS segment for a client"""
+    # Only segment URLs this proxy wrote into a playlist may be fetched.
+    if not verify_url(url, sig):
+        raise HTTPException(status_code=403, detail="Invalid segment signature")
+
     try:
         # Decode the URL
         segment_url = unquote(url)
@@ -1349,6 +1370,8 @@ async def get_hls_segment(
                 range_header,
             )
             return response
+        except HTTPException:
+            raise
         except Exception as stream_error:
             logger.error(f"Stream response error: {stream_error}")
             # Fall back to error response
@@ -1358,6 +1381,8 @@ async def get_hls_segment(
                 headers={"Content-Type": "text/plain"},
             )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error serving segment: {e}")
         logger.error(f"Exception type: {type(e)}")
@@ -1373,9 +1398,12 @@ async def get_hls_segment_ts(
     request: Request,
     client_id: str = Query(..., description="Client ID"),
     url: str = Query(..., description="The segment URL to proxy"),
+    sig: Optional[str] = Query(
+        None, description="Signature from the rewritten playlist"
+    ),
 ):
     """Proxy HLS segment with .ts extension for better ffplay compatibility"""
-    return await get_hls_segment(stream_id, request, client_id, url)
+    return await get_hls_segment(stream_id, request, client_id, url, sig)
 
 
 @app.get("/hls/{stream_id}/segment.m4s")
@@ -1384,9 +1412,12 @@ async def get_hls_segment_m4s(
     request: Request,
     client_id: str = Query(..., description="Client ID"),
     url: str = Query(..., description="The segment URL to proxy"),
+    sig: Optional[str] = Query(
+        None, description="Signature from the rewritten playlist"
+    ),
 ):
     """Proxy fMP4/CMAF HLS segment (used for HEVC and Apple AVKit playback)."""
-    return await get_hls_segment(stream_id, request, client_id, url)
+    return await get_hls_segment(stream_id, request, client_id, url, sig)
 
 
 @app.get("/hls/{stream_id}/segment.mp4")
@@ -1395,9 +1426,12 @@ async def get_hls_segment_mp4(
     request: Request,
     client_id: str = Query(..., description="Client ID"),
     url: str = Query(..., description="The segment URL to proxy"),
+    sig: Optional[str] = Query(
+        None, description="Signature from the rewritten playlist"
+    ),
 ):
     """Proxy fMP4 HLS init segment (EXT-X-MAP) or .mp4 segment file."""
-    return await get_hls_segment(stream_id, request, client_id, url)
+    return await get_hls_segment(stream_id, request, client_id, url, sig)
 
 
 @app.get("/dash/{stream_id}/manifest.mpd")
@@ -1532,10 +1566,24 @@ async def get_dash_segment_by_base(
     resolved against the rewritten <BaseURL> and RFC 3986 drops that query, so
     DashProcessor puts it in the path (`.../segment/{client_seg}/{base}/`).
     `path` is the exact relative reference the player resolved.
+
+    `encoded_base` carries the signature DashProcessor added, and the resolved
+    URL must stay on the signed base's scheme and host - a `path` such as
+    `//other-host/x` would otherwise replace the host during urljoin.
     """
+    base_url = DashProcessor.verify_base(encoded_base)
+    if base_url is None:
+        raise HTTPException(status_code=403, detail="Invalid segment signature")
+    segment_url = urljoin(base_url, path)
+    parsed_base, parsed_segment = urlparse(base_url), urlparse(segment_url)
+    if (parsed_segment.scheme, parsed_segment.netloc) != (
+        parsed_base.scheme,
+        parsed_base.netloc,
+    ):
+        raise HTTPException(status_code=403, detail="Segment not allowed")
+
     try:
         client_id = unquote(client_seg)
-        segment_url = urljoin(DashProcessor.decode_base(encoded_base), path)
         range_header = request.headers.get("range")
 
         client_info_data = get_client_info(request)
@@ -1561,10 +1609,16 @@ async def get_dash_file(
     request: Request,
     client_id: str = Query(..., description="Client ID"),
     url: str = Query(..., description="The segment URL to proxy"),
+    sig: Optional[str] = Query(
+        None, description="Signature from the rewritten manifest"
+    ),
 ):
     """Proxy a fully-qualified DASH segment/init URL (SegmentList). This route is
     the direct DASH counterpart of the HLS segment route - identical signature
     (`client_id` + `url` required query params), identical body."""
+    if not verify_url(url, sig):
+        raise HTTPException(status_code=403, detail="Invalid segment signature")
+
     try:
         segment_url = unquote(url)
         range_header = request.headers.get("range")
