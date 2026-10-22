@@ -23,7 +23,7 @@ from fastapi.responses import StreamingResponse
 
 from config import settings
 from ts_overlap import OverlapTrimmer, TRIM_MATCHED, TRIM_NO_MATCH
-from ts_canonicalizer import TSCanonicalizer
+from ts_canonicalizer import TSCanonicalizer, TSCanonicalizationError
 
 logger = logging.getLogger(__name__)
 
@@ -1858,33 +1858,100 @@ class StreamManager:
         # Wrap the response, not just the primary generator: subscriber queues,
         # promoted readers and seamless upstream handoffs all pass this boundary.
         original = response.body_iterator
+        initial_epoch = info.direct_generation
+        initial_client = self.clients.get(client_id)
+        initial_connection_id = (
+            initial_client.active_connection_id if initial_client else None
+        )
 
         async def canonicalized():
-            adapter = TSCanonicalizer()
-            epoch = info.direct_generation
-            try:
-                async with aclosing(original):
-                    async for chunk in original:
-                        if self.streams.get(stream_id) is not info:
+            source = original
+            epoch = initial_epoch
+            connection_id = initial_connection_id
+            attempts = 0
+            output_started = False
+            configured_max = settings.MAX_FAILOVER_ATTEMPTS
+            max_attempts = configured_max if configured_max > 0 else (
+                len(info.failover_urls) if info.failover_urls else 999
+            )
+            while True:
+                adapter = TSCanonicalizer()
+                try:
+                    async with aclosing(source):
+                        try:
+                            async for chunk in source:
+                                if self.streams.get(stream_id) is not info:
+                                    return
+                                current_epoch = info.direct_generation
+                                if current_epoch != epoch:
+                                    adapter.start_generation()
+                                    epoch = current_epoch
+                                # Source generators fence stale reads before yielding.
+                                data = adapter.feed(chunk)
+                                if data:
+                                    output_started = True
+                                    yield data
+                            tail = adapter.finish()
+                            if tail:
+                                yield tail
                             return
-                        current_epoch = info.direct_generation
-                        if current_epoch != epoch:
-                            adapter.start_generation()
-                            epoch = current_epoch
-                        # The source generators fence stale reads BEFORE yielding.
-                        # No await between epoch inspection and feed.
-                        data = adapter.feed(chunk)
-                        if data:
-                            yield data
-                    # A transient upstream EOF is handled inside the original
-                    # generator; only terminal EOF validates the final fragment.
-                    tail = adapter.finish()
-                    if tail:
-                        yield tail
-            finally:
-                # aclosing above also runs for adapter failures / early close;
-                # never retry or fall back to unadapted source bytes here.
-                pass
+                        except TSCanonicalizationError:
+                            # This error lives outside the raw source generator and
+                            # must be recovered here, on the owned input (not FFmpeg's
+                            # outer stream). Never feed rejected bytes to the decoder.
+                            async with info.direct_recovery_lock:
+                                if (
+                                    self.streams.get(stream_id) is not info
+                                    or not self._is_qsv_owned_input(info)
+                                    or epoch != info.direct_generation
+                                    or self._direct_broadcast_primary.get(stream_id)
+                                    not in (None, connection_id)
+                                ):
+                                    raise
+                                recovered = False
+                                # A failed adapter cannot be reused. Replacing it
+                                # after output would reset CC/codec ABI mid-encoder;
+                                # late errors therefore end this input cleanly.
+                                if (
+                                    not output_started
+                                    and attempts < max_attempts
+                                    and (info.failover_resolver_url or info.failover_urls)
+                                ):
+                                    attempts += 1
+                                    recovered = await self._update_failover_url(
+                                        stream_id, "normalization_input_error",
+                                        expected_generation=epoch,
+                                    )
+                                if (
+                                    self.streams.get(stream_id) is not info
+                                    or epoch != info.direct_generation
+                                    or not self._is_qsv_owned_input(info)
+                                ):
+                                    raise
+                                # Invalidate the rejected source before aclose can
+                                # promote subscribers or offer its upstream handoff.
+                                if (
+                                    connection_id is not None
+                                    and self._direct_broadcast_primary.get(stream_id)
+                                    == connection_id
+                                ):
+                                    await self._detach_direct_generation(stream_id, connection_id)
+                                else:
+                                    info.direct_generation += 1
+                                if not recovered:
+                                    raise
+                finally:
+                    if connection_id is not None:
+                        await self.cleanup_client(client_id, connection_id)
+                # The old upstream is closed before opening the selected candidate.
+                # Keep this HTTP response open and reset all adapter discovery state.
+                next_response = await self._stream_continuous_direct_original(
+                    stream_id, client_id, range_header
+                )
+                source = next_response.body_iterator
+                epoch = info.direct_generation
+                client = self.clients.get(client_id)
+                connection_id = client.active_connection_id if client else None
 
         response.body_iterator = canonicalized()
         return response
@@ -3742,6 +3809,10 @@ class StreamManager:
                         if (
                             generation == stream_info.direct_generation
                             and stream_context is not None
+                            and (
+                                not self._is_qsv_owned_input(stream_info)
+                                or bool(self._direct_broadcast_queues.get(stream_id))
+                            )
                             and self._can_hand_off_upstream(
                                 stream_id, client_id, cancel_event
                             )
@@ -3904,11 +3975,19 @@ class StreamManager:
                 f"Returning 206 Partial Content with range: {provider_content_range} and length {provider_content_length}"
             )
 
+        # Capture ownership before disconnect/delete can remove the outer stream.
+        qsv_owned_input = self._is_qsv_owned_input(stream_info)
         # Create new generator that yields the first chunk then continues with the rest
         async def generate_with_first_chunk():
-            yield first_chunk
-            async for chunk in gen:
-                yield chunk
+            try:
+                yield first_chunk
+                async for chunk in gen:
+                    yield chunk
+            finally:
+                if qsv_owned_input:
+                    # Adapter rejection can happen on the prefetched first chunk.
+                    # Closing only this wrapper leaves the provider generator open.
+                    await gen.aclose()
 
         return StreamingResponse(
             generate_with_first_chunk(),
@@ -5562,7 +5641,8 @@ class StreamManager:
         return await self._update_failover_url(stream_id, reason)
 
     async def _update_failover_url(
-        self, stream_id: str, reason: str = "manual"
+        self, stream_id: str, reason: str = "manual",
+        *, expected_generation: Optional[int] = None,
     ) -> bool:
         """Update to next failover URL and signal all clients to reconnect
 
@@ -5589,6 +5669,13 @@ class StreamManager:
         # Resolve the next failover URL using the preferred method
         old_url = stream_info.current_url
         next_url = await self._resolve_next_failover_url(stream_id, reason=reason)
+
+        if expected_generation is not None and (
+            self.streams.get(stream_id) is not stream_info
+            or stream_info.direct_generation != expected_generation
+            or not self._is_qsv_owned_input(stream_info)
+        ):
+            return False
 
         if not next_url:
             logger.warning(f"No more failover URLs available for stream {stream_id}")
