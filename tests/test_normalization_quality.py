@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from config import Settings
-from live_normalization import VAAPI_PROFILE, QSV_PROFILE, QSV_DEVICE_ARGS
+from live_normalization import VAAPI_PROFILE, QSV_PROFILE, QSV_DEVICE_ARGS, QSV_DECODING_ARGS
 
 DEINTERLACE = "bwdif=mode=send_field:parity=auto:deint=interlaced"
 
@@ -59,8 +59,8 @@ def test_moving_video_field_rate_and_quality(tmp_path, encoder, source):
     filters = "tinterlace=mode=interleave_top,setfield=tff" if source == "i25" else "setfield=prog"
     fixture_codec = ["-c:v", "ffv1"]
     if encoder == "qsv":
-        # QSV cannot decode FFV1 or lossless H.264. Reference the same lossy
-        # 8-bit compatible source, not the pre-encode synthetic generator.
+        # Use the same realistic 8-bit H.264 source as the QSV handoff tests.
+        # Decode is explicitly software; QSV is only the output encoder.
         fixture_codec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
                          "-pix_fmt", "yuv420p"]
         if source == "i25":
@@ -88,7 +88,7 @@ def test_moving_video_field_rate_and_quality(tmp_path, encoder, source):
     output_args[output_args.index("0:a:0")] = "0:a:0?"
     device = ["-vaapi_device", "/dev/dri/renderD128"] if encoder == "vaapi" else []
     if encoder == "qsv":
-        device = list(QSV_DEVICE_ARGS)
+        device = [*QSV_DEVICE_ARGS, *QSV_DECODING_ARGS]
     run("ffmpeg", "-v", "error", *device, "-i", original, *output_args)
     output = Path(output_args[-1])
     after = probe(output)

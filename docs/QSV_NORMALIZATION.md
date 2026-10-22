@@ -1,5 +1,69 @@
 # Explicit QSV live normalization
 
+## Accepted FFmpeg standard presentation policy
+
+Max explicitly accepted the existing FFmpeg bwdif presentation policy for the
+single **unbounded truncated-video TFF-i25** source cut. Decode is statically
+software (`-hwaccel none -err_detect:v explode -ec:v 0`); bwdif is CPU and only
+encoding is QSV. This is not a runtime fallback or a custom FFmpeg build/patch.
+
+The source-field vector remains unchanged in `source-timeline-oracle.json`
+(`expected_pts`). The separate `standard_bwdif_policy_pts` vector replaces only
+the second field of the last valid A picture with the midpoint of independently
+known valid A and B input PTS. In the moving fixture this is index 101:
+**311640 → 313440 ticks (+1800 ticks / 20 ms)**, while B stays **317040**.
+This is an accepted presentation-time tradeoff, **not preservation of all source
+field timestamps**. The expectation is never calculated from actual output.
+All other source-cut cases require the identical original source vector.
+
+No permission is implied for an extra corrupt/concealed image, missing/repeated
+valid field, hidden TS continuity loss, shifted B epoch, altered audio, or relaxed
+SSIM/A/V limits. The original source-position mismatches remain visible separately
+from policy mismatches; exact count, PTS-policy equality, unique hashes, independent
+image-position matches and every existing audio/quality gate remain mandatory.
+The P1 continuity fix is integrated: media CC rebasing preserves source deltas
+and retransmissions rather than concealing transport loss.
+
+Fresh acceptance artifacts, runner, flags, source hashes, JUnit and per-case
+video/audio evidence are retained under:
+
+```text
+/opt/data/profiles/infra/workspace/m3u-live-failover/optin-acceptance/qsv-check/accepted-standard-policy/
+```
+
+Historical failures below remain historical failures under their then-required
+source-PTS contract; this explicit owner decision, not a deinterlacer correction,
+changes acceptance of precisely the single field above.
+
+## Historical rejected source-position contract (superseded by explicit decision)
+
+The previous strict source-position gate returned 588 passed / 1 failed: all
+valid pictures survived, but the last valid A second-field timestamp differed
+by 20 ms. Unbounded truncated progressive p25/p50 also have a real missing-picture
+clock slot (80/40 ms transition interval), not arbitrary gap allowance.
+
+FFmpeg 8.1.2 `estdif` and `w3fdif` were source-inspected and replayed; both use the
+same adjacent-picture midpoint timing as bwdif and did not restore source-field
+PTS. No replacement filter or patched FFmpeg is included. Earlier raw evidence
+is retained under `/opt/data/profiles/infra/cache/scratch/qsv-field-fix/`.
+
+The earlier full-tree Ruff findings were introduced within this QSV workstream,
+not inherited upstream exceptions. They are resolved in the accepted candidate:
+semicolon statements split without semantic changes, and the shared integration
+fixture registered without an imported-name/parameter collision. AST inspection
+confirmed the four F811 findings were **not duplicate test definitions**; no test
+was removed or skipped. The integration test file still collects all 17 cases.
+
+Fresh all-flags verification after P1 integration: **616 passed, 0 failed,
+0 skipped**, with 105 framework/datetime deprecation warnings. Separate QSV
+Full-HD p25/p50/i25 verification: **3 passed**; exact finite counts 50/100/100,
+40/20/20-ms cadence, progressive distinct pictures and SSIM
+0.998968/0.998896/0.998530 respectively. All 18 moving source-cut cases passed
+against the accepted policy; only the documented source-field mismatch exists.
+Both real API cases (AAC and DVB AC-3) passed, including automatic A EOF to B
+within one POST/player GET, changed PMT/ES PIDs and actual reset epochs.
+Full-tree `ruff check src tests` and `git diff --check` pass.
+
 ## Contract and implementation
 
 `POST /streams` accepts `normalization_encoder: "cpu" | "vaapi" | "qsv"`.
@@ -21,13 +85,15 @@ Pipeline:
 ```text
 -init_hw_device vaapi=va:/dev/dri/renderD128
 -init_hw_device qsv=qs@va -filter_hw_device qs
--hwaccel qsv -hwaccel_output_format qsv
--vf hwdownload,format=nv12,bwdif=mode=send_field:parity=auto:deint=interlaced,format=nv12,hwupload=extra_hw_frames=64
+-hwaccel none -err_detect:v explode -ec:v 0
+-vf bwdif=mode=send_field:parity=auto:deint=interlaced,format=nv12,hwupload=extra_hw_frames=64
 -fps_mode passthrough -enc_time_base 1/90000
 -c:v h264_qsv -global_quality 18 -g 25 -bf 0
 ```
 
-This is GPU decode/encode with **CPU bwdif**, not full-GPU processing. Conditional
+This is explicit **CPU decode and bwdif, GPU QSV encode**, not full-GPU processing
+and not a runtime fallback. Strict software decode rejects truncated unbounded
+H.264 PES that hardware decode conceals even with strict error flags. Conditional
 bwdif preserves progressive cadence and produces two temporal pictures per
 interlaced input frame. Unconditional QSV VPP field doubling was rejected because
 it also doubles progressive sources and loses a finite-clip tail frame.
@@ -41,14 +107,22 @@ no B-frame reordering, passthrough timestamps, explicit 90 kHz encoder timebase.
 Neither the original profile nor any provider settings were edited.
 
 Admission checks an Intel character render node, then generates four compatible
-8-bit H.264 TFF frames in RAM and exercises the actual QSV decode/download/bwdif/
-upload/encode chain. Each subprocess has a 10-second timeout and is killed and
+8-bit H.264 TFF frames in RAM and exercises the actual software-decode/bwdif/
+upload/QSV-encode chain. Each subprocess has a 10-second timeout and is killed and
 reaped on timeout/cancellation. Nonzero exit, missing executable/device, fixture
 failure and initialization errors produce 503 before any stream allocation.
 The fixture never contains provider inputs or secrets. This does not guarantee
 that every future source codec, resolution or device state is supported.
 
-## Executed quality evidence
+## Historical hardware-decoder evidence (not current candidate acceptance)
+
+The tables and recorded suite totals in this section and the historical handoff
+recheck below were obtained with the previous hardware-decoder preset. They do
+not validate the current software-decoder candidate. Earlier evidence is retained
+under `qsv-check/final-acceptance/`; the then-required original source-position
+gate failed even when all valid frame counts matched. No historical failure is
+reclassified as a pass; current acceptance uses the explicitly separate policy
+and fresh evidence documented above.
 
 Disposable image `m3u-proxy:quality-d23fd81`, FFmpeg 8.1.2, Intel renderD128,
 `--rm --network none --device /dev/dri --cpus 2 --memory 1g --pids-limit 128`,
@@ -99,7 +173,7 @@ cases plus the three real QSV API captures. Host-side `ruff check src tests` and
 `git diff --check` also passed (the sandbox image does not contain Ruff; no
 package was installed). All owned validation containers were removed.
 
-## Handoff cadence recheck (finite transport helper, not API acceptance)
+## Historical hardware-decode handoff recheck (not current acceptance)
 
 `329463e` already contains `-fflags +genpts+discardcorrupt`. No QSV source
 profile/filter change or timestamp rewrite was needed for the retained original
@@ -113,8 +187,8 @@ RAM-only profile invocation whose complete arguments were not retained.
 The new opt-in `tests/test_qsv_cadence_handoff.py` exercises moving 320x180 p25,
 p50 and TFF-i25, changed PMT and elementary PIDs, A at offset 20 s and B at 0 s,
 997-byte feed chunks, finite A EOF and fully drained B. It imports the product
-`ts_canonicalizer` if present; on this branch it uses an owned external helper via
-`QSV_CADENCE_HELPER`, without copying that module into product sources.
+`ts_canonicalizer` directly. The older run below used an external helper; no
+external helper is required by the current test.
 
 The complete-video cut has **126 / 251 / 252** expected and distinct output
 frames (p25 / p50 / i25), with exact 40 / 20 / 20 ms intervals. A second cut
@@ -157,7 +231,7 @@ metrics and control results are outside the repository under:
 Reproduce only in an owned network-none Intel render-node sandbox, serially:
 
 ```sh
-PYTHONPATH=src RUN_QSV_CADENCE=1 QSV_CADENCE_HELPER=/lab/helper \
+PYTHONPATH=src RUN_QSV_CADENCE=1 \
 QSV_CADENCE_CONTROL=/lab/canonical.ts RUN_QSV_QUALITY=1 RUN_VAAPI_QUALITY=1 \
 NORMALIZATION_QUALITY_SIZE=320x180 python -m pytest tests -q --tb=short
 ```
@@ -168,9 +242,10 @@ NORMALIZATION_QUALITY_SIZE=320x180 python -m pytest tests -q --tb=short
 ## Limits
 
 These are synthetic correctness/regression checks, not provider/client visual
-acceptance, throughput or GPU stress tests. No provider traffic, user-stream
-stop, deployed configuration edit, push or deployment was performed. Changed-PMT
-continuous A→B acceptance and TS canonicalization are a separate integration
-workstream; these fixed-source QSV cadence results do not prove that transport
-contract. GPU/codec failure after creation can terminate playback. No automatic
-fallback hides an unsupported hardware-decode input.
+acceptance, throughput or GPU stress tests. Current acceptance includes the
+product TS canonicalizer and real loopback API changed-PMT automatic A→B tests
+with AAC and DVB AC-3; it does not establish arbitrary codec/source compatibility.
+The only accepted field-time deviation is the 20-ms special cut documented above.
+No provider traffic, user-stream stop, deployed configuration edit, push or
+deployment was performed. GPU/codec failure after creation can terminate playback.
+No automatic fallback hides a decoder/encoder failure.

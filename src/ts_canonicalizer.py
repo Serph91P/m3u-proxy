@@ -129,7 +129,8 @@ class _Section:
             size = 3 + length
             if len(self.data) < size:
                 break
-            section = bytes(self.data[:size]); del self.data[:size]
+            section = bytes(self.data[:size])
+            del self.data[:size]
             if crc32_mpeg(section) != 0:
                 raise TSCanonicalizationError('PSI CRC mismatch')
             if section[5] & 0xC1 != 0xC1 or section[6:8] != b'\x00\x00':
@@ -182,7 +183,8 @@ class TSCanonicalizer:
             for pos in range(0, len(view), 188 * 64):
                 self._buffer.extend(view[pos:pos + 188 * 64])
                 while len(self._buffer) >= 188:
-                    packet = bytes(self._buffer[:188]); del self._buffer[:188]
+                    packet = bytes(self._buffer[:188])
+                    del self._buffer[:188]
                     output.extend(self._consume(packet))
             return bytes(output)
         except (TSCanonicalizationError, IndexError) as error:

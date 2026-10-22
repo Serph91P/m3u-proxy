@@ -1,15 +1,12 @@
-"""Finite, fully drained hardware handoff gate (not proxy API evidence).
+"""Fully drained software-decode/QSV-encode gate, not proxy API evidence.
 
-RUN_QSV_CADENCE=1 requires a disposable network-none render-node sandbox and
-QSV_CADENCE_HELPER names an external transport-worker helper directory only
-until ts_canonicalizer is integrated into product sources. No helper is copied
-into this branch. QSV_CADENCE_CONTROL optionally names the retained 1077-frame
-original handoff fixture. Three truncated-video cases intentionally remain red
-until the transport layer can gate incomplete zero-length video PES correctly.
+RUN_QSV_CADENCE=1 requires an owned network-none render-node sandbox.
+The timeline oracle uses uncut input frame/PES positions and an audio epoch;
+no arbitrary gap allowance or output-derived timestamp expectation is used.
+QSV_CADENCE_CONTROL optionally names the retained original control fixture.
 """
 import array
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -28,6 +25,58 @@ def run(*args):
 
 def frames(path):
     return json.loads(run("ffprobe", "-v", "error", "-select_streams", "v", "-show_frames", "-of", "json", path).stdout)["frames"]
+
+
+def pes_headers(data, pid):
+    """Independent fixture-only PUSI/PTS parser (one access unit per PES)."""
+    headers = []
+    for at in range(0, len(data), 188):
+        packet = data[at:at + 188]
+        assert len(packet) == 188 and packet[0] == 0x47
+        if not packet[1] & 64 or ((packet[1] & 31) << 8 | packet[2]) != pid:
+            continue
+        start = 5 + packet[4] if packet[3] & 32 else 4
+        pes = packet[start:]
+        assert pes[:3] == b"\x00\x00\x01" and pes[7] & 128
+        p = pes[9:14]
+        assert p[0] & 1 and p[2] & 1 and p[4] & 1
+        pts = ((p[0] >> 1 & 7) << 30 | p[1] << 22
+               | (p[2] >> 1) << 15 | p[3] << 7 | p[4] >> 1)
+        headers.append(dict(byte_offset=at, pts=pts,
+                            pes_length=int.from_bytes(pes[4:6], "big")))
+    return headers
+
+
+def source_positions(a_pts, b_pts, *, fields, last_demux_pts, audio_epoch,
+                     output_audio_epoch, audio_delay, source_period):
+    """Keep each valid source field at its own time, including around a cut.
+
+    The damaged unbounded PES may consume one demux clock slot, but it does not
+    contain a valid picture/field. B starts one source period after that slot.
+    The global mux translation is anchored by audio, not video output fitting.
+    """
+    translation = output_audio_epoch + audio_delay - audio_epoch
+    b_epoch = last_demux_pts + source_period
+    return ([p + field * (source_period // fields) + translation
+             for p in a_pts for field in range(fields)]
+            + [p - b_pts[0] + b_epoch + field * (source_period // fields) + translation
+               for p in b_pts for field in range(fields)])
+
+
+def standard_bwdif_positions(source_pts, *, kind, cut_mode, bounded_video_pes,
+                             complete_frames_a):
+    """Explicit accepted FFmpeg policy; never derive expectations from output.
+
+    Only unbounded truncated-video i25 shifts the last valid A second field
+    to the midpoint of valid A/B input PTS. Keep source positions separately.
+    """
+    presentation = source_pts.copy()
+    if kind == "i25" and cut_mode == "truncated-video" and not bounded_video_pes:
+        second_field = complete_frames_a * 2 - 1
+        midpoint = (source_pts[second_field - 1] + source_pts[second_field + 1]) // 2
+        assert midpoint - source_pts[second_field] == 1800
+        presentation[second_field] = midpoint
+    return presentation
 
 
 def normalize(source, target, *, discard=True):
@@ -86,19 +135,11 @@ def test_qsv_discardcorrupt_retained_control(tmp_path):
 def test_qsv_moving_handoff_cadence(tmp_path, kind, cut_mode, bounded_video_pes):
     if os.environ.get("RUN_QSV_CADENCE") != "1":
         pytest.skip("explicit disposable QSV hardware sandbox required")
-    try:
-        import ts_canonicalizer as module
-    except ModuleNotFoundError as error:
-        if error.name != "ts_canonicalizer":
-            raise
-        helper = Path(os.environ["QSV_CADENCE_HELPER"]) / "ts_canonicalizer.py"
-        spec = importlib.util.spec_from_file_location("cadence_transport_helper", helper)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        import sys
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+    import ts_canonicalizer as module
     inputs = []
+    uncut_frames = []
+    uncut_pes = []
+    uncut_audio_pes = []
     for generation, tone in enumerate((440, 880)):
         source = tmp_path / f"{kind}-{generation}.ts"
         rate = 25 if kind == "p25" else 50
@@ -125,6 +166,11 @@ def test_qsv_moving_handoff_cadence(tmp_path, kind, cut_mode, bounded_video_pes)
         flags = frames(source)
         assert len(flags) == (75 if kind != "p50" else 150)
         assert {f["interlaced_frame"] for f in flags} == {int(kind == "i25")}
+        uncut_frames.append([int(f["pts"]) for f in flags])
+        uncut_pes.append(pes_headers(source.read_bytes(), 256 + generation * 256))
+        uncut_audio_pes.append(pes_headers(source.read_bytes(), 257 + generation * 256))
+        assert [p["pts"] for p in uncut_pes[-1]] == uncut_frames[-1]
+        (tmp_path / f"uncut-{generation}.ts").write_bytes(source.read_bytes())
         inputs.append(source)
     # End immediately before a video PES start: every selected video access
     # unit is complete, while an in-flight interleaved audio PES may be cut.
@@ -166,6 +212,17 @@ def test_qsv_moving_handoff_cadence(tmp_path, kind, cut_mode, bounded_video_pes)
     clean += clean_adapter.feed(inputs[1].read_bytes()) + clean_adapter.finish()
     reference = tmp_path / "reference.ts"
     reference.write_bytes(clean)
+    # Visual oracle comes from retained *uncut* inputs, not decoding the same
+    # damaged stream or fitting neighbouring output images. Trim only after
+    # field reconstruction, preserving the original source temporal context.
+    visual_reference = tmp_path / "uncut-visual-reference.mkv"
+    fields_a = complete_frames_a * (2 if kind == "i25" else 1)
+    run("ffmpeg", "-v", "error", "-i", tmp_path / "uncut-0.ts",
+        "-i", tmp_path / "uncut-1.ts", "-filter_complex",
+        f"[0:v]bwdif=mode=send_field:parity=auto:deint=interlaced,trim=end_frame={fields_a},setpts=PTS-STARTPTS[a];"
+        "[1:v]bwdif=mode=send_field:parity=auto:deint=interlaced,setpts=PTS-STARTPTS[b];"
+        "[a][b]concat=n=2:v=1:a=0[v]", "-map", "[v]", "-fps_mode", "passthrough",
+        "-c:v", "ffv1", "-threads", "2", visual_reference)
     adapter = module.TSCanonicalizer()
     canonical = bytearray()
     for n, source in enumerate(inputs):
@@ -184,27 +241,83 @@ def test_qsv_moving_handoff_cadence(tmp_path, kind, cut_mode, bounded_video_pes)
         "first_video_pes_length": video_pes_length,
         "complete_source_a_frames": complete_frames_a,
         "expected_frames": expected, "actual_frames": len(output),
-        "scope": "finite hardware gate, not product API",
+        "scope": "finite software decode/QSV encode gate, not product API",
     }, indent=2))
     assert len(output) == expected
     assert all(not f["interlaced_frame"] for f in output)
     step = 3600 if kind == "p25" else 1800
     pts = [int(f["pts"]) for f in output]
-    assert {b - a for a, b in zip(pts, pts[1:])} == {step}
+    assert all(b > a for a, b in zip(pts, pts[1:]))
+    packets = json.loads(run("ffprobe", "-v", "error", "-show_packets", "-of", "json", target).stdout)["packets"]
+    audio = [p for p in packets if p["codec_type"] == "audio"]
+    source_period = 3600 if kind != "p50" else 1800
+    damaged_slot = cut_mode == "truncated-video" and not bounded_video_pes
+    last_demux_index = complete_frames_a - 1 + int(damaged_slot)
+    expected_pts = source_positions(
+        uncut_frames[0][:complete_frames_a], uncut_frames[1],
+        fields=2 if kind == "i25" else 1,
+        last_demux_pts=uncut_frames[0][last_demux_index],
+        audio_epoch=uncut_audio_pes[0][0]["pts"],
+        output_audio_epoch=int(audio[0]["pts"]),
+        audio_delay=1920, source_period=source_period)
+    assert int(audio[0]["duration"]) == 1920  # AAC encoder priming, 1024/48000 s
+    assert int(audio[0]["pts"]) == 126000  # unchanged MPEG-TS mux epoch
+    mismatches = [dict(index=i, expected=wanted, actual=actual)
+                  for i, (wanted, actual) in enumerate(zip(expected_pts, pts))
+                  if wanted != actual]
+    policy_pts = standard_bwdif_positions(
+        expected_pts, kind=kind, cut_mode=cut_mode,
+        bounded_video_pes=bounded_video_pes, complete_frames_a=complete_frames_a)
+    policy_mismatches = [dict(index=i, expected=wanted, actual=actual)
+                         for i, (wanted, actual) in enumerate(zip(policy_pts, pts))
+                         if wanted != actual]
+    oracle = dict(
+        standard_bwdif_policy_pts=policy_pts, policy_mismatches=policy_mismatches,
+        uncut_frame_pts=uncut_frames, uncut_video_pes=uncut_pes,
+        uncut_audio_pes=uncut_audio_pes, cut_byte_offset=cut,
+        complete_cut_byte_offset=complete_cut, cut_frame_index=complete_frames_a,
+        damaged_clock_slot=damaged_slot, expected_pts=expected_pts, actual_pts=pts,
+        mismatches=mismatches,
+        source_epoch=uncut_audio_pes[0][0]["pts"],
+        output_audio_epoch=int(audio[0]["pts"]), aac_priming_ticks=1920,
+        b_video_epoch=expected_pts[complete_frames_a * (2 if kind == "i25" else 1)],
+        original_uniform_gate_passes=all(b - a == step for a, b in zip(pts, pts[1:])))
+    (tmp_path / "source-timeline-oracle.json").write_text(json.dumps(oracle, indent=2))
+    # All other cases retain their original exact uniform-cadence contract.
+    if not damaged_slot:
+        assert {b - a for a, b in zip(pts, pts[1:])} == {step}
+    # Source-position gate is asserted after visual/audio measurements, so a
+    # failing field position still retains complete diagnostic evidence.
     # No muxer-clamped timestamps may hide a decoder/filter regression.
     log = Path(str(target) + ".log").read_text()
     assert "Non-monotonic" not in log and "non monotonically" not in log
     assert len([line for line in log.splitlines() if "timestamp discontinuity" in line]) == 1
+    # Independent B audio and video timestamps must share the same recovered
+    # input epoch, not merely finish within a relaxed A/V endpoint tolerance.
+    lines = log.splitlines()
+    recovered = {}
+    for stream, source_pts in (("video", uncut_frames[1][0]),
+                               ("audio", uncut_audio_pes[1][0]["pts"])):
+        index = next(i for i, line in enumerate(lines)
+                     if "demuxer ->" in line and f"type:{stream} pkt_pts:{source_pts} " in line)
+        fixed = next(line for line in lines[index + 1:]
+                     if "demuxer+ffmpeg ->" in line and f"type:{stream} " in line)
+        recovered[stream] = int(re.search(r"pkt_pts:(-?\d+)", fixed).group(1))
+    assert recovered["audio"] - recovered["video"] == uncut_audio_pes[1][0]["pts"] - uncut_frames[1][0]
+    assert recovered["video"] + int(audio[0]["pts"]) + 1920 == oracle["b_video_epoch"]
+    oracle["recovered_b_input_epoch"] = recovered
+    (tmp_path / "source-timeline-oracle.json").write_text(json.dumps(oracle, indent=2))
     if cut_mode == "truncated-audio":
         assert re.search(r"Packet corrupt \(stream = 1,.*dropping it", log)
     hashes = run("ffmpeg", "-v", "error", "-i", target, "-an", "-fps_mode", "passthrough", "-f", "framemd5", "-").stdout.decode()
+    (tmp_path / "output.framemd5").write_text(hashes)
     hashes = [line.rsplit(",", 1)[-1].strip() for line in hashes.splitlines() if not line.startswith("#")]
     assert len(hashes) == len(set(hashes)) == expected
     # Independent SW decode/bwdif reference. Its timestamps are not used as the
     # cadence oracle: reset each stream to sequence indexes ONLY for comparison.
-    comparison = run("ffmpeg", "-v", "info", "-fflags", "+discardcorrupt", "-i", reference,
+    comparison = run("ffmpeg", "-v", "info", "-i", visual_reference,
                      "-i", target, "-lavfi",
-                     "[0:v]bwdif=mode=send_field:parity=auto:deint=interlaced,settb=1/90000,setpts=N[a];[1:v]settb=1/90000,setpts=N[b];[a][b]ssim=stats_file=" + str(tmp_path / "ssim.log"),
+                     "[0:v]settb=1/90000,setpts=N[a];[1:v]settb=1/90000,setpts=N[b];[a][b]ssim=stats_file=" + str(tmp_path / "ssim.log"),
                      "-an", "-f", "null", "-")
     scores = [float(re.search(r"All:([0-9.]+)", line).group(1)) for line in (tmp_path / "ssim.log").read_text().splitlines()]
     assert len(scores) == expected
@@ -213,13 +326,17 @@ def test_qsv_moving_handoff_cadence(tmp_path, kind, cut_mode, bounded_video_pes)
     # Every encoded frame must match its own input position more closely than
     # either neighbour: detects repeats/drops that aggregate SSIM can conceal.
     raws = []
-    for path, vf in ((reference, "bwdif=mode=send_field:parity=auto:deint=interlaced,"), (target, "")):
+    for path, vf in ((visual_reference, ""), (target, "")):
         raw = run("ffmpeg", "-v", "error", "-fflags", "+discardcorrupt", "-i", path, "-an", "-vf", vf + "scale=80:44", "-pix_fmt", "gray", "-fps_mode", "passthrough", "-f", "rawvideo", "-").stdout
         raws.append([raw[i:i + 3520] for i in range(0, len(raw), 3520)])
     assert len(raws[0]) == len(raws[1]) == expected
+    matches = []
     for i, actual in enumerate(raws[1]):
         distances = {j: sum(abs(a - b) for a, b in zip(actual, raws[0][j])) for j in range(max(0, i - 2), min(expected, i + 3))}
         assert min(distances, key=distances.get) == i, (i, distances)
+        matches.append(dict(index=i, closest_reference_index=min(distances, key=distances.get),
+                            distances=distances))
+    (tmp_path / "source-image-positions.json").write_text(json.dumps(matches, indent=2))
     pcm = array.array("h", run("ffmpeg", "-v", "error", "-i", target, "-vn", "-ac", "1", "-ar", "48000", "-f", "s16le", "-").stdout)
     tones = [sum(a <= 0 < b for a, b in zip(s, s[1:])) for s in (pcm[24000:72000], pcm[-72000:-24000])]
     assert abs(tones[0] - 440) < 8 and abs(tones[1] - 880) < 8
@@ -247,11 +364,14 @@ def test_qsv_moving_handoff_cadence(tmp_path, kind, cut_mode, bounded_video_pes)
     evidence = dict(kind=kind, cut_mode=cut_mode, bounded_video_pes=bounded_video_pes,
                     complete_source_a_frames=complete_frames_a,
                     intentionally_discarded_incomplete_video_pes=int(cut_mode == "truncated-video"),
-                    frames=expected, unique_frames=len(set(hashes)), pts_step=step,
+                    frames=expected, unique_frames=len(set(hashes)), nominal_pts_step=step,
+                    actual_pts_deltas=sorted({b - a for a, b in zip(pts, pts[1:])}),
+                    source_position_mismatches=mismatches,
                     max_audio_gap_seconds=max(abs(gap) for gap in audio_gaps),
                     max_quiet_seconds=longest_quiet * .01, av_head_seconds=av_head,
                     min_ssim=min(scores), tones=tones, av_tail_seconds=av_tail,
                     source_sha256=[hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs],
-                    scope="finite real QSV profile + external adapter, NOT proxy API")
+                    scope="finite real QSV profile + product adapter, NOT proxy API")
     (tmp_path / "evidence.json").write_text(json.dumps(evidence, indent=2))
     print("QSV_CADENCE", json.dumps(evidence))
+    assert pts == policy_pts, policy_mismatches

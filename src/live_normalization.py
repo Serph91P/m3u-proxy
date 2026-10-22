@@ -37,15 +37,15 @@ VAAPI_PROFILE = (
 )
 
 
-# QSV decodes and encodes on the GPU; bwdif is deliberately a CPU field-aware
-# stage. Unconditional vpp_qsv field doubling corrupts progressive cadence.
+# Decode and field-aware bwdif stay on the CPU; only encoding uses QSV.
+# Hardware decoding conceals truncated unbounded H.264 PES despite explode/ec=0.
+# This is a static correctness-first preset, not a runtime software fallback.
 QSV_DEVICE_ARGS = (
     "-init_hw_device", "vaapi=va:/dev/dri/renderD128",
     "-init_hw_device", "qsv=qs@va", "-filter_hw_device", "qs",
-    "-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
 )
+QSV_DECODING_ARGS = ("-hwaccel", "none", "-err_detect:v", "explode", "-ec:v", "0")
 QSV_FILTER = (
-    "hwdownload,format=nv12,"
     "bwdif=mode=send_field:parity=auto:deint=interlaced,"
     "format=nv12,hwupload=extra_hw_frames=64"
 )
@@ -59,7 +59,7 @@ QSV_PROFILE = (
     "-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 "
     "-reconnect_delay_max 2 -reconnect_max_retries 5 "
     "-fflags +genpts+discardcorrupt -merge_pmt_versions 1 "
-    "-dts_delta_threshold 1 -i {input_url} "
+    "-dts_delta_threshold 1 " + " ".join(QSV_DECODING_ARGS) + " -i {input_url} "
     "-map 0:v:0 -map 0:a:0 -vf " + QSV_FILTER + " "
     + " ".join(QSV_ENCODING_ARGS) + " "
     "-af aresample=async=1:first_pts=0 -c:a aac -b:a 128k "
@@ -68,10 +68,10 @@ QSV_PROFILE = (
 
 
 async def validate_qsv_encoder():
-    """Exercise decode/download/bwdif/upload/encode before any stream allocation.
+    """Exercise software decode/bwdif/QSV upload/encode before stream allocation.
 
     Generate a tiny compatible H.264 TFF fixture in RAM, never a provider URL or
-    lossless H.264 (unsupported by QSV). Both child processes are bounded/reaped.
+    lossless H.264. Both child processes are bounded/reaped.
     No cached admission and no automatic software/VAAPI fallback.
     """
     if not _intel_device_available():
@@ -85,7 +85,8 @@ async def validate_qsv_encoder():
             "-crf", "18", "-pix_fmt", "yuv420p", "-flags", "+ilme+ildct",
             "-x264-params", "tff=1", "-an", "-f", "mpegts", "pipe:1",
         ),
-        (*QSV_DEVICE_ARGS, "-i", "pipe:0", "-vf", QSV_FILTER,
+        (*QSV_DEVICE_ARGS, *QSV_DECODING_ARGS, "-fflags", "+genpts+discardcorrupt",
+         "-i", "pipe:0", "-vf", QSV_FILTER,
          *QSV_ENCODING_ARGS, "-an", "-f", "null", "-"),
     )
     for index, command in enumerate(commands):

@@ -5,10 +5,13 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.responses import StreamingResponse
 
-from tests.test_live_normalization import manager  # noqa: F401
+from tests import test_live_normalization as normalization_tests
 from tests.test_ts_canonicalizer import fixture, packets, pat, pmt, section, media, split, pid
 from stream_manager import StreamInfo
 from ts_canonicalizer import TSCanonicalizer, TSCanonicalizationError
+
+# Register the shared fixture without an unused-import/parameter name collision.
+manager = normalization_tests.manager
 
 
 def owned(manager, encoder="qsv"):

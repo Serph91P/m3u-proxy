@@ -36,7 +36,8 @@ def test_qsv_real_api_automatic_changed_pmt_handoff(tmp_path, audio_codec):
             '-f', 'lavfi', '-i', f'sine=frequency={tone}:sample_rate=48000:duration=20',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-threads', '2',
             '-g', '25', '-bf', '0', '-c:a', audio_codec, '-mpegts_pmt_start_pid', str(pmt),
-            '-mpegts_start_pid', str(es), '-mpegts_flags', '+system_b', '-f', 'mpegts', file)
+            '-mpegts_start_pid', str(es), '-mpegts_flags', '+system_b',
+            '-output_ts_offset', '20' if label == 'a' else '0', '-f', 'mpegts', file)
         data[label] = file.read_bytes()
         description = json.loads(run('ffprobe', '-v', 'error', '-show_programs', '-of', 'json', file).stdout)['programs'][0]
         assert description['pmt_pid'] == pmt
@@ -60,7 +61,12 @@ def test_qsv_real_api_automatic_changed_pmt_handoff(tmp_path, audio_codec):
             assert at == len(descriptors) and 0x6A in tags
             inputs[label]['audio_stream_type'] = 6
             inputs[label]['audio_descriptors_hex'] = descriptors.hex()
-    assert inputs['a']['start_pts'] == inputs['b']['start_pts']
+    # FFmpeg's explicit positive output offset anchors A's video at 21.4 s;
+    # default mux timing shifts B's video by codec-specific encoder priming.
+    # Pin both actual epochs exactly rather than assuming offset=PTS delta.
+    priming = 1920 if audio_codec == 'aac' else 480
+    assert inputs['a']['start_pts'] == 20 * 90000 + 126000
+    assert inputs['b']['start_pts'] == 126000 + priming
     # Simulated provider close, deliberately not an access-unit/PES aligned cut.
     data['a'] = data['a'][:int(len(data['a']) * 6 / 20) // 188 * 188]
     stop = threading.Event()
@@ -200,6 +206,18 @@ def test_qsv_real_api_automatic_changed_pmt_handoff(tmp_path, audio_codec):
     colors = ['a' if rgb[i] > rgb[i + 2] else 'b' for i in range(0, len(rgb), 3)]
     assert colors.count('a') >= 100 and colors.count('b') >= 100
     assert colors == sorted(colors), 'unexpected visual source reversal'
+    ssim = {}
+    for label, start in (('a', 0), ('b', colors.count('a'))):
+        count = colors.count(label)
+        stats = evidence / f'{label}-ssim.log'
+        run('ffmpeg', '-v', 'error', '-i', capture, '-i', evidence / f'{label}.ts',
+            '-lavfi',
+            f'[0:v]trim=start_frame={start}:end_frame={start + count},settb=1/90000,setpts=N[a];'
+            f'[1:v]trim=end_frame={count},settb=1/90000,setpts=N[b];'
+            f'[a][b]ssim=stats_file={stats}', '-an', '-f', 'null', '-')
+        scores = [float(line.split('All:')[1].split()[0]) for line in stats.read_text().splitlines()]
+        assert len(scores) == count and min(scores) > .99
+        ssim[label] = min(scores)
     pcm = run('ffmpeg', '-v', 'error', '-i', capture, '-vn', '-ac', '1', '-ar', '48000', '-f', 'f32le', '-').stdout
     samples = array.array('f', pcm)
     def tone_at(seconds):
@@ -218,8 +236,9 @@ def test_qsv_real_api_automatic_changed_pmt_handoff(tmp_path, audio_codec):
     result = dict(scope='real product API, intentional capture cut while finite B active',
                   operations=operations, upstream_requests=requests, snapshots=snapshots,
                   frames=len(frames), frames_a=colors.count('a'), frames_b=colors.count('b'),
-                  pts_steps=steps, tones_hz=tones, maximum_packet_gaps=gaps,
+                  pts_steps=steps, min_ssim=ssim, tones_hz=tones, maximum_packet_gaps=gaps,
                   encoder='qsv', input_audio_codec=audio_codec, inputs=inputs,
-                  automatic_a_eof=True, changed_pmt_and_es=True)
+                  automatic_a_eof=True, changed_pmt_and_es=True,
+                  pts_reset_ticks=inputs['a']['start_pts'] - inputs['b']['start_pts'])
     (evidence / 'handoff.json').write_text(json.dumps(result, indent=2))
     print('API_QSV_HANDOFF', json.dumps(result))

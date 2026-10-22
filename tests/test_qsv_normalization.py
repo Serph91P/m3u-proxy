@@ -31,7 +31,12 @@ async def test_qsv_private_ids_pool_reuse_and_server_owned_profile(manager, monk
     gpu = streams[-1]
     assert gpu.metadata["normalization_encoder"] == "qsv"
     args = gpu.transcode_ffmpeg_args
-    assert args[args.index("-hwaccel") + 1] == "qsv"
+    assert args[args.index("-hwaccel") + 1] == "none"
+    assert args[args.index("-err_detect:v") + 1] == "explode"
+    assert args[args.index("-ec:v") + 1] == "0"
+    assert args.index("-ec:v") < args.index("-i")
+    assert "hwdownload" not in normalization.QSV_FILTER
+    assert "-hwaccel_output_format" not in args
     assert args[args.index("-c:v") + 1] == "h264_qsv"
     assert args[args.index("-vf") + 1] == normalization.QSV_FILTER
     assert args[args.index("-global_quality") + 1] == "18"
@@ -103,7 +108,7 @@ async def test_qsv_probe_failures_reap_and_allocate_nothing(manager, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_qsv_admission_exercises_exact_hardware_pipeline(monkeypatch):
+async def test_qsv_admission_exercises_exact_static_software_decode_qsv_encode_pipeline(monkeypatch):
     monkeypatch.setattr(normalization, "_intel_device_available", lambda: True)
     source = SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b"fixture", None)), kill=Mock())
     encoder = SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(None, None)), kill=Mock())
@@ -114,8 +119,11 @@ async def test_qsv_admission_exercises_exact_hardware_pipeline(monkeypatch):
     assert generator[generator.index("-c:v") + 1] == "libx264"
     assert "tff=1" in generator and "18" in generator
     template = shlex.split(normalization.QSV_PROFILE)
-    for option in ("-hwaccel", "-hwaccel_output_format", "-vf", "-c:v", "-global_quality", "-enc_time_base", "-bf"):
+    for option in ("-hwaccel", "-err_detect:v", "-ec:v", "-fflags", "-vf", "-c:v", "-global_quality", "-enc_time_base", "-bf"):
         assert hardware[hardware.index(option) + 1] == template[template.index(option) + 1]
+    assert hardware[hardware.index("-hwaccel") + 1] == "none"
+    assert "-hwaccel_output_format" not in hardware
+    assert hardware.index("-ec:v") < hardware.index("-i")
     assert hardware[hardware.index("-i") + 1] == "pipe:0"
     encoder.communicate.assert_awaited_once_with(input=b"fixture")
     source.kill.assert_not_called()

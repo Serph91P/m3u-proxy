@@ -73,7 +73,8 @@ def test_arbitrary_chunks_and_multi_packet_pmt(seed):
     c, rng, actual = TSCanonicalizer(), random.Random(seed), bytearray()
     while data:
         n = rng.randint(1, 211)
-        actual.extend(c.feed(data[:n])); data = data[n:]
+        actual.extend(c.feed(data[:n]))
+        data = data[n:]
     actual.extend(c.finish())
     assert actual == expected
     # Reassemble emitted PMT and verify MPEG-2 CRC.
@@ -86,7 +87,8 @@ def test_arbitrary_chunks_and_multi_packet_pmt(seed):
 def test_fail_closed(change):
     c = TSCanonicalizer()
     if change == 'crc':
-        data = bytearray(fixture()); data[12] ^= 1
+        data = bytearray(fixture())
+        data[12] ^= 1
     elif change == 'codec':
         data = fixture(audio_type=3)
     elif change == 'ca':
@@ -94,7 +96,8 @@ def test_fail_closed(change):
     elif change == 'multi':
         data = packets(0, section(0, b'\x00\x09\xc1\x00\x00\x00\x07\xe4\xe8\x00\x08\xe5\xe8'))
     elif change == 'scrambled':
-        data = bytearray(fixture()); data[-185] |= 0x80
+        data = bytearray(fixture())
+        data[-185] |= 0x80
     else:
         data = fixture()[:-1]
     with pytest.raises(TSCanonicalizationError):
@@ -105,7 +108,9 @@ def test_fail_closed(change):
 
 
 def test_incompatible_generation_does_not_emit_backup():
-    c = TSCanonicalizer(); c.feed(fixture()); c.start_generation()
+    c = TSCanonicalizer()
+    c.feed(fixture())
+    c.start_generation()
     with pytest.raises(TSCanonicalizationError):
         c.feed(fixture(1512, 768, 769, audio_type=129))
 
@@ -135,7 +140,8 @@ def test_separate_pcr_and_adaptation_only_preserved():
 
 
 def test_generation_discards_incomplete_transport_packet():
-    c = TSCanonicalizer(); c.feed(fixture() + b'\x47\x00')
+    c = TSCanonicalizer()
+    c.feed(fixture() + b'\x47\x00')
     c.start_generation()
     assert c.feed(fixture(1512, 768, 769))
     c.finish()
@@ -202,14 +208,16 @@ def test_stable_table_repeat_has_continuous_output_cc():
 
 
 def test_unannounced_table_change_rejected():
-    c = TSCanonicalizer(); c.feed(fixture())
+    c = TSCanonicalizer()
+    c.feed(fixture())
     with pytest.raises(TSCanonicalizationError, match='PAT changed'):
         c.feed(packets(0, pat(1512), cc=1))
 
 
 @pytest.mark.parametrize('offset,value', [(0, 0), (1, 0x80), (3, 0x00), (3, 0x30)])
 def test_invalid_transport_headers(offset, value):
-    packet = bytearray(media(512)); packet[offset] = value
+    packet = bytearray(media(512))
+    packet[offset] = value
     if value == 0x30:
         packet[4] = 184
     with pytest.raises(TSCanonicalizationError):

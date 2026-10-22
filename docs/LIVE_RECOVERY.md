@@ -95,15 +95,19 @@ PMT and reconnect policy as CPU. Hardware decoding is deliberately not enabled
 for source-switch robustness. Clients cannot choose a command or device.
 
 QSV is a separate explicit mode, not a VAAPI alias or automatic fallback. It
-uses QSV hardware decoding, a download to NV12, **software** field-aware bwdif,
-and upload to QSV H.264 encoding. This is **not a full-GPU pipeline**. The
+uses explicit software decoding (`-hwaccel none -err_detect:v explode -ec:v 0`),
+**software** field-aware bwdif, and upload to QSV H.264 encoding. This is a static
+preset, **not a full-GPU pipeline** and not a runtime software fallback. The
 server-owned preset uses `-global_quality 18 -g 25 -bf 0`,
 `-fps_mode passthrough -enc_time_base 1/90000`; no inherited bitrate cap, B-frame
 reordering or unconditional VPP field doubling. A bounded local H.264 TFF
-fixture exercises the actual decode/download/bwdif/upload/encode path before
+fixture exercises the actual software-decode/bwdif/upload/QSV-encode path before
 allocation (at most two 10-second subprocess waits). Missing hardware, driver,
 decoder or encoder returns 503 without input/output allocation or CPU fallback.
-Hardware/codec failure after admission can still terminate the stream. See
+Hardware/codec failure after admission can still terminate the stream. The
+accepted FFmpeg standard policy shifts only the last valid A picture's second
+field by 20 ms at the unbounded truncated-video i25 cut; it does not preserve
+every original source-field PTS or permit extra concealed pictures. See
 [QSV normalization evidence and limits](QSV_NORMALIZATION.md).
 
 Optional trusted `LIVE_NORMALIZE_PROFILE` overrides the **CPU** default below
