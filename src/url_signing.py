@@ -9,6 +9,7 @@ deployment already has; without a token a random per-process key is used.
 """
 
 import base64
+import functools
 import hashlib
 import hmac
 import secrets
@@ -19,11 +20,19 @@ from config import settings
 _FALLBACK_KEY = secrets.token_bytes(32)
 
 
+@functools.lru_cache(maxsize=4)
+def _derive_key(api_token: str) -> bytes:
+    # Rewritten playlists expose (url, signature) pairs, so a fast hash would let
+    # anyone holding one test API_TOKEN guesses offline. PBKDF2 makes each guess
+    # expensive; the result is cached, so this runs once per process.
+    return hashlib.pbkdf2_hmac(
+        "sha256", api_token.encode(), b"m3u-proxy-url-signing", 600_000
+    )
+
+
 def _signing_key() -> bytes:
     if settings.API_TOKEN:
-        return hashlib.sha256(
-            b"m3u-proxy-url-signing\0" + settings.API_TOKEN.encode()
-        ).digest()
+        return _derive_key(settings.API_TOKEN)
     return _FALLBACK_KEY
 
 
