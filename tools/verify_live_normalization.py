@@ -71,6 +71,27 @@ def fixture(path, color, tone, pid, offset):
     )
 
 
+def gpu_snapshot(api_pid):
+    """Read only the owned API's encoder, never unrelated host processes."""
+    children = Path(f"/proc/{api_pid}/task/{api_pid}/children").read_text().split()
+    for child in children:
+        proc = Path(f"/proc/{child}")
+        if b"h264_vaapi" not in (proc / "cmdline").read_bytes():
+            continue
+        render_fds = [fd for fd in (proc / "fd").iterdir()
+                      if str(fd.readlink()) == "/dev/dri/renderD128"]
+        assert render_fds, "owned encoder has no render-node FD"
+        engines = {}
+        for fd in render_fds:
+            for line in (proc / "fdinfo" / fd.name).read_text().splitlines():
+                if line.startswith("drm-engine-video:"):
+                    engines[fd.name] = int(line.split()[1])
+        assert engines, "Intel DRM video-engine accounting unavailable"
+        return {"pid": int(child), "start_ticks": (proc / "stat").read_text().split()[21],
+                "render_fds": len(render_fds), "video_ns": max(engines.values())}
+    raise AssertionError("owned VAAPI encoder not found")
+
+
 def inspect(path):
     decoded = subprocess.run(
         [
@@ -150,6 +171,12 @@ def inspect(path):
             last_time[index] = timestamp
     assert backwards == 0, backwards
     assert len(max_gaps) == 2 and all(gap < 0.1 for gap in max_gaps.values()), max_gaps
+    video = json.loads(run("ffprobe", "-v", "error", "-select_streams", "v:0",
+                           "-show_frames", "-of", "json", str(path)))["frames"]
+    assert all(frame["interlaced_frame"] == 0 for frame in video)
+    timestamps = [float(frame["best_effort_timestamp_time"]) for frame in video]
+    assert all(abs(b - a - 0.04) < 0.00002
+               for a, b in zip(timestamps, timestamps[1:])), "progressive25 cadence changed"
     warnings = decoded.stderr.decode(errors="replace")
     assert "non-monoton" not in warnings.lower(), warnings
     return {
@@ -305,6 +332,7 @@ def main():
                     ):
                         response.raise_for_status()
                         input_delete_status = None
+                        gpu_start = gpu_end = None
                         for chunk in response.iter_bytes():
                             output.write(chunk)
                             if input_delete_status is None:
@@ -315,7 +343,14 @@ def main():
                                 assert input_delete_status == 409, rejected.text
                                 retained = client.get(f"/streams/{outer_id}").json()["stream"]
                                 assert retained["normalization_input_stream_id"] == inner_id
+                                if encoder == "vaapi":
+                                    gpu_start = gpu_snapshot(process.pid)
                             if time.monotonic() - started >= 24:
+                                if encoder == "vaapi":
+                                    gpu_end = gpu_snapshot(process.pid)
+                                    assert gpu_start["pid"] == gpu_end["pid"]
+                                    assert gpu_start["start_ticks"] == gpu_end["start_ticks"]
+                                    assert gpu_end["video_ns"] > gpu_start["video_ns"]
                                 break
                         else:
                             raise AssertionError(
@@ -339,6 +374,8 @@ def main():
                     result = inspect(capture)
                     result.update(
                         normalization_encoder=encoder,
+                        progressive_cadence_seconds=0.04,
+                        gpu_evidence={"start": gpu_start, "end": gpu_end} if encoder == "vaapi" else None,
                         player_gets=1,
                         initial_posts=1,
                         source_requests=list(requests),

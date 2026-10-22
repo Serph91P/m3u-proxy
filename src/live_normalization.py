@@ -28,9 +28,11 @@ VAAPI_PROFILE = (
     "-reconnect_delay_max 2 -reconnect_max_retries 5 "
     "-fflags +genpts+discardcorrupt -merge_pmt_versions 1 "
     "-dts_delta_threshold 1 -i {input_url} "
-    "-map 0:v:0 -map 0:a:0 -vf fps=25,format=nv12,hwupload "
+    "-map 0:v:0 -map 0:a:0 "
+    "-vf bwdif=mode=send_field:parity=auto:deint=interlaced,format=nv12,hwupload "
+    "-fps_mode passthrough "
     "-af aresample=async=1:first_pts=0 "
-    "-c:v h264_vaapi -g 25 -bf 0 -c:a aac -b:a 128k "
+    "-c:v h264_vaapi -rc_mode CQP -qp 18 -g 25 -bf 0 -c:a aac -b:a 128k "
     "-f mpegts {output_args}"
 )
 
@@ -60,8 +62,11 @@ async def validate_vaapi_encoder():
             "ffmpeg", "-hide_banner", "-v", "error", "-nostdin",
             "-vaapi_device", VAAPI_DEVICE,
             "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25",
-            "-frames:v", "1", "-vf", "format=nv12,hwupload",
-            "-c:v", "h264_vaapi", "-bf", "0", "-g", "25",
+            "-frames:v", "1", "-vf",
+            "bwdif=mode=send_field:parity=auto:deint=interlaced,format=nv12,hwupload",
+            "-fps_mode", "passthrough",
+            "-c:v", "h264_vaapi", "-rc_mode", "CQP", "-qp", "18",
+            "-bf", "0", "-g", "25",
             "-an", "-f", "null", "-",
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )

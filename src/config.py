@@ -92,9 +92,11 @@ class Settings(BaseSettings):
         "-reconnect_delay_max 2 -reconnect_max_retries 5 "
         "-fflags +genpts+discardcorrupt -merge_pmt_versions 1 "
         "-dts_delta_threshold 1 -i {input_url} "
-        "-map 0:v:0 -map 0:a:0 -vf fps=25 "
+        "-map 0:v:0 -map 0:a:0 "
+        "-vf bwdif=mode=send_field:parity=auto:deint=interlaced "
+        "-fps_mode passthrough "
         "-af aresample=async=1:first_pts=0 "
-        "-c:v libx264 -preset ultrafast -tune zerolatency -threads 2 "
+        "-c:v libx264 -preset ultrafast -crf 18 -tune zerolatency -threads 2 "
         "-g 25 -bf 0 -c:a aac -b:a 128k -f mpegts {output_args}"
     )
     MAX_CLIENTS_PER_SHARED_STREAM: int = 10

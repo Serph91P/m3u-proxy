@@ -30,17 +30,22 @@ async def test_encoder_isolates_both_identities_and_preserves_cpu_custom(manager
     assert c.normalization_input_id != g.normalization_input_id
     assert "libx264" in c.transcode_ffmpeg_args
     assert "h264_vaapi" in g.transcode_ffmpeg_args
-    assert "fps=25,format=nv12,hwupload" in g.transcode_ffmpeg_args
+    assert "bwdif=mode=send_field:parity=auto:deint=interlaced,format=nv12,hwupload" in g.transcode_ffmpeg_args
     assert not any(flag in g.transcode_ffmpeg_args for flag in ("-hwaccel", "-preset", "-tune", "libx264"))
     assert "-merge_pmt_versions 1" in " ".join(g.transcode_ffmpeg_args)
     assert "aresample=async=1:first_pts=0" in g.transcode_ffmpeg_args
     assert g.metadata["normalization_encoder"] == "vaapi"
     reused = await api.create_stream(payload(normalize_live_output=True, normalization_encoder="vaapi"), scope())
     assert reused["stream_id"] == g.stream_id
-    monkeypatch.setattr(settings, "LIVE_NORMALIZE_PROFILE", settings.LIVE_NORMALIZE_PROFILE + " -metadata title=custom")
+    monkeypatch.setattr(settings, "LIVE_NORMALIZE_PROFILE", "-i {input_url} -vf null -c:v libx264 -crf 22 -metadata title=custom -f mpegts {output_args}")
     custom = await api.create_stream(payload(normalize_live_output=True), scope())
     assert custom["stream_id"] != c.stream_id
-    assert "title=custom" in manager.streams[custom["stream_id"]].transcode_ffmpeg_args
+    custom_args = manager.streams[custom["stream_id"]].transcode_ffmpeg_args
+    assert "title=custom" in custom_args
+    assert custom_args[custom_args.index("-vf") + 1] == "null"
+    assert custom_args[custom_args.index("-crf") + 1] == "22"
+    assert custom_args.count("-vf") == custom_args.count("-crf") == 1
+    assert "-fps_mode" not in custom_args
     assert (await api.create_stream(payload(normalize_live_output=True, normalization_encoder="vaapi"), scope()))["stream_id"] == g.stream_id
 
 

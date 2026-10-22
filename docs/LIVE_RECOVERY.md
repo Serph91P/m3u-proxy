@@ -62,8 +62,16 @@ POSTs retain the active encoder and selected backup. GET activity holds the
 owned input; deleting/expiring the outer cascades only to its owned input.
 Cancellation/partial creation failures roll back new allocations.
 
-The CPU profile decodes compatible audio/video into 25 fps H.264/AAC MPEG-TS,
-normalizing timestamp discontinuities with the existing FFmpeg pipeline. This
+The standard profiles decode compatible audio/video into H.264/AAC MPEG-TS,
+normalizing timestamp discontinuities with the existing FFmpeg pipeline. Both use
+`bwdif=mode=send_field:parity=auto:deint=interlaced` and `-fps_mode passthrough`:
+correctly flagged interlaced 25-frame/s input becomes 50 progressive frames/s;
+progressive 25/50-frame/s input retains its cadence. There is no fixed FPS filter
+or output `-r`. This relies on decoded frame interlace/parity flags; mislabeled
+sources are not auto-detected or repaired. CPU uses explicit x264 CRF 18 (the
+existing ultrafast/zerolatency preset remains); VAAPI uses CQP/QP 18. These are
+lossy encode settings, not equivalent quality scales or a perceptual guarantee.
+The GOP limit remains 25 **frames**, not an FPS constraint. This
 costs latency/CPU and changes bytes/codecs/quality. It is **not a claim of arbitrary
 codec, track-layout, resolution or protocol switching**; audio and video tracks
 are required. HLS/DASH/VOD remain outside this feature. Repeated failures still
@@ -79,8 +87,10 @@ and VAAPI driver supporting `h264_vaapi`. A bounded synthetic upload/encode prob
 runs before allocation; absent/inaccessible/non-Intel hardware or a failed probe
 returns HTTP 503, never silently falls back to CPU. Device loss after creation
 can still end playback. The server-owned template uses software decoding,
-`-vaapi_device /dev/dri/renderD128`, `fps=25,format=nv12,hwupload`,
-`-c:v h264_vaapi -g 25 -bf 0`, and the same audio resampling/AAC, timestamp,
+`-vaapi_device /dev/dri/renderD128`,
+`bwdif=mode=send_field:parity=auto:deint=interlaced,format=nv12,hwupload`,
+`-fps_mode passthrough -c:v h264_vaapi -rc_mode CQP -qp 18 -g 25 -bf 0`,
+and the same audio resampling/AAC, timestamp,
 PMT and reconnect policy as CPU. Hardware decoding is deliberately not enabled
 for source-switch robustness. Clients cannot choose a command or device.
 
@@ -92,17 +102,29 @@ already-running encoders. Keep a persistent MPEG-TS pipe output and test any
 customizations offline before using them.
 
 ```text
--analyzeduration 1000000 -probesize 1000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2 -reconnect_max_retries 5 -fflags +genpts+discardcorrupt -merge_pmt_versions 1 -dts_delta_threshold 1 -i {input_url} -map 0:v:0 -map 0:a:0 -vf fps=25 -af aresample=async=1:first_pts=0 -c:v libx264 -preset ultrafast -tune zerolatency -threads 2 -g 25 -bf 0 -c:a aac -b:a 128k -f mpegts {output_args}
+-analyzeduration 1000000 -probesize 1000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2 -reconnect_max_retries 5 -fflags +genpts+discardcorrupt -merge_pmt_versions 1 -dts_delta_threshold 1 -i {input_url} -map 0:v:0 -map 0:a:0 -vf bwdif=mode=send_field:parity=auto:deint=interlaced -fps_mode passthrough -af aresample=async=1:first_pts=0 -c:v libx264 -preset ultrafast -crf 18 -tune zerolatency -threads 2 -g 25 -bf 0 -c:a aac -b:a 128k -f mpegts {output_args}
 ```
 
 Offline acceptance (installed project dependencies; no providers or Emby needed):
 
 ```sh
-python -m pytest tests/test_live_normalization.py -q
+python -m pytest tests/test_live_normalization.py tests/test_normalization_quality.py -q
+# In a disposable --rm --network none --device /dev/dri sandbox only:
+RUN_VAAPI_QUALITY=1 NORMALIZATION_QUALITY_SIZE=1920x1080 python -m pytest tests/test_normalization_quality.py -q -s
 python tools/verify_live_normalization.py --encoder cpu
 # On an Intel VAAPI host/container with the render node and drivers available:
 python tools/verify_live_normalization.py --encoder vaapi
 ```
+
+The moving-video tests interleave a 50p `testsrc2` into real TFF fields before
+lossless fixture encoding, verify decoded interlace/parity flags, then check exact
+frame counts, PTS intervals, progressive output and distinct frame hashes. They
+compare to a lossless bwdif field-rate reference of the same decoded source.
+SSIM >= 0.97 is a synthetic regression floor for these high-quality encodes;
+count/PTS checks independently reject dropped fields or CFR duplicate frames.
+This is not a subjective/provider/player quality or throughput certification.
+The VAAPI transport verifier also requires a stable owned FFmpeg PID, an open
+render-node FD and increasing Intel DRM video-engine time across A→B.
 
 The acceptance uses one initial API POST and **one player GET**, faults A's real
 HTTP body, then observes B's red→blue/440→880 Hz media in that same response.
