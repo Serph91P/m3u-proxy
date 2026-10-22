@@ -8,7 +8,7 @@ import httpx
 import pytest
 import uvicorn
 
-from tests.test_live_normalization import manager
+from tests.test_live_normalization import manager as manager
 from tests.test_qsv_ts_integration import dvb_fixture
 from tests.test_ts_canonicalizer import fixture
 from config import settings

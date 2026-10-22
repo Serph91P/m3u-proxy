@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from tests.test_live_recovery import manager, sources, A, B, C
+from tests.test_live_recovery import manager as manager, sources, A, B, C
 from config import settings
 from stream_manager import StreamInfo
 from ts_canonicalizer import TSCanonicalizationError
