@@ -1,6 +1,7 @@
 # Add src to path first
 from stream_manager import StreamManager
 from api import app, get_content_type, is_direct_stream
+from url_signing import sign_url
 import httpx
 import asyncio
 import pytest
@@ -234,7 +235,12 @@ class TestAPI:
         mock_stream_manager.register_client = AsyncMock(return_value=Mock())
 
         response = client.get(
-            "/hls/test_stream_123/segment?client_id=test_client&url=http://example.com/segment1.ts"
+            "/hls/test_stream_123/segment",
+            params={
+                "client_id": "test_client",
+                "url": "http://example.com/segment1.ts",
+                "sig": sign_url("http://example.com/segment1.ts"),
+            },
         )
         assert response.status_code == 200
         # Note: In tests, the media_type might not be set exactly as expected

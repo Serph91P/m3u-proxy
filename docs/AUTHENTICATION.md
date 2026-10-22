@@ -67,11 +67,16 @@ When authentication is enabled, the following endpoints require the `X-API-Token
 The following endpoints do **NOT** require authentication, as they are used by media players to stream content:
 
 - `GET /hls/{stream_id}/playlist.m3u8` - Get HLS playlist
-- `GET /hls/{stream_id}/segment` - Get HLS segment
-- `GET /hls/{stream_id}/segment.ts` - Get HLS segment (alternative)
+- `GET /hls/{stream_id}/segment` (and `.ts`, `.m4s`, `.mp4`) - Get HLS segment
+- `GET /dash/{stream_id}/manifest.mpd` - Get DASH manifest
+- `GET /dash/{stream_id}/segment/...` and `GET /dash/{stream_id}/file` - Get DASH segment
 - `GET /stream/{stream_id}` - Stream direct content
 
-These endpoints use the `stream_id` as their security mechanism - only users who know the stream ID can access the stream.
+Playlists and manifests are served for streams created through the protected API. When the proxy rewrites them, it adds an HMAC signature to every upstream URL (`&sig=` on HLS and DASH file URLs, inside the path for DASH segment bases). The segment and file endpoints reject any URL without a valid signature, so they can't be used to fetch arbitrary URLs. Local files are only served from transcoder output directories (`HLS_TEMP_DIR/m3u_proxy_hls_*`).
+
+The signing key is derived from `API_TOKEN`, so every worker sharing a token accepts each other's URLs. Without a token, a random key is generated at startup, and rewritten URLs stop working after a restart (players pick up new ones on their next playlist refresh).
+
+The `?url=` parameter on the playlist, manifest and stream endpoints creates a stream for that URL. It only accepts a signed URL (variant playlists the proxy rewrote) or a request that passes the API token check above.
 
 ## Usage Examples
 

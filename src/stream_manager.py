@@ -11,6 +11,7 @@ import httpx
 import logging
 import os
 import re
+import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from contextlib import aclosing
@@ -23,6 +24,7 @@ from fastapi.responses import StreamingResponse
 
 from config import settings
 from ts_overlap import OverlapTrimmer, TRIM_MATCHED, TRIM_NO_MATCH
+from url_signing import sign_url, verify_url
 
 logger = logging.getLogger(__name__)
 
@@ -236,8 +238,9 @@ class M3U8Processor:
         return "ts"
 
     def _rewrite_url(self, original_url: str, base_proxy_url: str) -> str:
-        """Rewrites a URL to point to the proxy, encoding the original URL."""
+        """Rewrites a URL to point to the proxy, encoding and signing the original URL."""
         encoded_url = quote(original_url, safe="")
+        signature = sign_url(original_url)
         # Check path only — strip query params to handle URLs like *.m3u8?location=ABC123
         path = original_url.split("?", 1)[0].lower()
         if path.endswith(".m3u8"):
@@ -245,10 +248,10 @@ class M3U8Processor:
             parent_param = (
                 f"&parent={self.parent_stream_id}" if self.parent_stream_id else ""
             )
-            return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}{parent_param}"
+            return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}{parent_param}&sig={signature}"
 
         kind = self._segment_kind(original_url)
-        return f"{base_proxy_url}/segment.{kind}?url={encoded_url}&client_id={self.client_id}"
+        return f"{base_proxy_url}/segment.{kind}?url={encoded_url}&client_id={self.client_id}&sig={signature}"
 
 
 class DashProcessor:
@@ -289,13 +292,31 @@ class DashProcessor:
         padded = token + "=" * (-len(token) % 4)
         return base64.urlsafe_b64decode(padded.encode()).decode()
 
+    @staticmethod
+    def sign_base(absolute_base_url: str) -> str:
+        """Encode an upstream directory URL plus its signature as one path segment
+        (`{encoded}.{signature}`; '.' never appears in URL-safe base64)."""
+        encoded = DashProcessor.encode_base(absolute_base_url)
+        return f"{encoded}.{sign_url(absolute_base_url)}"
+
+    @staticmethod
+    def verify_base(token: str) -> Optional[str]:
+        """Reverse of sign_base. Returns the upstream base URL, or None when the
+        token is malformed or its signature does not match."""
+        encoded, _, signature = token.partition(".")
+        try:
+            absolute_base_url = DashProcessor.decode_base(encoded)
+        except ValueError:
+            return None
+        return absolute_base_url if verify_url(absolute_base_url, signature) else None
+
     def _rewrite_absolute_url(self, absolute_url: str, base_proxy_url: str) -> str:
         # Fully-qualified SegmentList <SegmentURL> entries are explicit URIs the
         # player fetches verbatim - exactly like an HLS segment line - so this
         # is byte-for-byte the HLS rewrite (M3U8Processor._rewrite_url):
-        # ?url=<encoded>&client_id=<id>.
+        # ?url=<encoded>&client_id=<id>&sig=<signature>.
         encoded_url = quote(absolute_url, safe="")
-        return f"{base_proxy_url}/file?url={encoded_url}&client_id={self.client_id}"
+        return f"{base_proxy_url}/file?url={encoded_url}&client_id={self.client_id}&sig={sign_url(absolute_url)}"
 
     def _rewrite_base(self, absolute_base_url: str, base_proxy_url: str) -> str:
         # The ONE place DASH cannot match HLS: SegmentTemplate entries are
@@ -304,8 +325,7 @@ class DashProcessor:
         # string - so client_id cannot ride in the query the way it does on an
         # HLS segment line. It goes in the path instead (a path segment is
         # always preserved), so every resolved segment URL still carries it.
-        encoded = self.encode_base(absolute_base_url)
-        return f"{base_proxy_url}/segment/{quote(self.client_id, safe='')}/{encoded}/"
+        return f"{base_proxy_url}/segment/{quote(self.client_id, safe='')}/{self.sign_base(absolute_base_url)}/"
 
     def process_manifest(
         self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None
@@ -5022,6 +5042,25 @@ class StreamManager:
             return "text/vtt"
         return "video/mp2t"
 
+    @staticmethod
+    def _local_segment_path(segment_url: str) -> Optional[str]:
+        """Resolve a local transcoder segment URL to a real path, or None when it
+        falls outside every transcoder output dir (`<base>/m3u_proxy_hls_*/`).
+
+        The base is HLS_TEMP_DIR, plus the system tempdir that
+        SharedTranscodingProcess falls back to when HLS_TEMP_DIR is unusable.
+        """
+        path = segment_url[7:] if segment_url.startswith("file://") else segment_url
+        real_path = os.path.realpath(path)
+        for base_dir in {settings.HLS_TEMP_DIR, tempfile.gettempdir()}:
+            if not base_dir:
+                continue
+            relative = os.path.relpath(real_path, os.path.realpath(base_dir))
+            parts = relative.split(os.sep)
+            if len(parts) >= 2 and parts[0].startswith("m3u_proxy_hls_"):
+                return real_path
+        return None
+
     async def proxy_hls_segment(
         self,
         stream_id: str,
@@ -5031,6 +5070,17 @@ class StreamManager:
     ) -> StreamingResponse:
         """Proxy individual HLS segment - direct pass-through with automatic failover"""
         logger.info(f"Proxying HLS segment for stream {stream_id}, client {client_id}")
+
+        # Local files are only ever transcoder output; refuse anything else
+        # before a response starts.
+        local_path = None
+        if segment_url.startswith("file://") or os.path.exists(segment_url):
+            local_path = self._local_segment_path(segment_url)
+            if local_path is None:
+                logger.warning(
+                    f"Refusing local segment outside transcoder output for stream {stream_id}"
+                )
+                raise HTTPException(status_code=403, detail="Segment not allowed")
 
         async def segment_generator():
             bytes_served = 0
@@ -5051,15 +5101,8 @@ class StreamManager:
                         headers.update(stream_info.headers)
 
                     # If the segment is a local file generated by an HLS transcoder, read from disk
-                    if segment_url.startswith("file://") or os.path.exists(segment_url):
-                        # Strip file:// prefix if present
-                        path = (
-                            segment_url[7:]
-                            if segment_url.startswith("file://")
-                            else segment_url
-                        )
-                        # Stream the file contents
-                        with open(path, "rb") as fh:
+                    if local_path:
+                        with open(local_path, "rb") as fh:
                             while True:
                                 chunk = fh.read(32768)
                                 if not chunk:

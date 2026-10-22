@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from fastapi.testclient import TestClient
 import api
+from url_signing import sign_url
 
 
 def test_transcode_hls_segment_serving(monkeypatch):
@@ -23,7 +24,9 @@ def test_transcode_hls_segment_serving(monkeypatch):
     sm = StreamManager()
 
     # Create temp hls dir and write a simple playlist + a small .ts file
-    tmpdir = tempfile.mkdtemp(prefix="test_m3u_hls_")
+    # Same naming as SharedTranscodingProcess output dirs, which are the only
+    # local paths the segment route will read
+    tmpdir = tempfile.mkdtemp(prefix="m3u_proxy_hls_test_")
     playlist_text = """#EXTM3U
 #EXT-X-VERSION:3
 #EXTINF:1.0,
@@ -95,7 +98,12 @@ segment1.ts
     file_url = f"file://{seg_path}"
     # Note: api.get_hls_segment expects query params: client_id and url
     seg_resp = client.get(
-        f"/hls/{stream_id}/segment?client_id=test_client&url={file_url}"
+        f"/hls/{stream_id}/segment",
+        params={
+            "client_id": "test_client",
+            "url": file_url,
+            "sig": sign_url(file_url),
+        },
     )
     assert seg_resp.status_code == 200, seg_resp.text
     # Response content should match the bytes we wrote
