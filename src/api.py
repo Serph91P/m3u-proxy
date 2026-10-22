@@ -278,6 +278,7 @@ class StreamCreateRequest(BaseModel):
     end_session_on_reconnect: Optional[bool] = None
     single_recovery_per_exit: Optional[bool] = None
     normalize_live_output: Optional[bool] = None
+    normalization_encoder: Literal["cpu", "vaapi"] = "cpu"
 
     @field_validator("url")
     @classmethod

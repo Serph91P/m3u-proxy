@@ -6,6 +6,7 @@ sources with different content, PIDs and clocks; NOT arbitrary codec changes.
 Run with the installed project dependencies and ffmpeg/ffprobe on PATH.
 """
 
+import argparse
 import array
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -163,6 +164,9 @@ def inspect(path):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--encoder", choices=("cpu", "vaapi"), default="cpu")
+    encoder = parser.parse_args().encoder
     with tempfile.TemporaryDirectory(prefix="live-normalize-") as directory:
         temp = Path(directory)
         a, b = temp / "a.ts", temp / "b.ts"
@@ -215,7 +219,8 @@ def main():
         source = f"http://127.0.0.1:{server.server_port}"
         env = {
             k: os.environ[k]
-            for k in ("PATH", "HOME", "LANG", "LD_LIBRARY_PATH", "TMPDIR")
+            for k in ("PATH", "HOME", "LANG", "LD_LIBRARY_PATH", "TMPDIR",
+                      "LIBVA_DRIVERS_PATH", "LIBVA_DRIVER_NAME")
             if k in os.environ
         }
         env.update(
@@ -279,6 +284,7 @@ def main():
                         "silent_close_retry_window": 0,
                         "end_session_on_reconnect": True,  # must be overridden internally
                         "normalize_live_output": True,
+                        "normalization_encoder": encoder,
                         "metadata": {
                             "id": "fixture",
                             "playlist_uuid": "fixture-provider",
@@ -286,6 +292,7 @@ def main():
                     }
                     created = client.post("/streams", json=options)
                     created.raise_for_status()
+                    assert created.json()["metadata"]["normalization_encoder"] == encoder
                     outer_id = created.json()["stream_id"]
                     started = time.monotonic()
                     capture = temp / "normalized.ts"
@@ -331,6 +338,7 @@ def main():
                     assert count["counts"] == {"fixture-provider": 1}, count
                     result = inspect(capture)
                     result.update(
+                        normalization_encoder=encoder,
                         player_gets=1,
                         initial_posts=1,
                         source_requests=list(requests),

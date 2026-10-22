@@ -44,7 +44,9 @@ chunked input body at a source switch can make FFmpeg stop instead of reconnect.
 Existing handoff/source-selection behavior is reused, not replaced. Original
 metadata, upstream headers, failover resolver and silence settings reach the
 private input. Public metadata is original metadata plus
-`normalize_live_output="true"`; no `transcoding="true"` marker is injected, so
+`normalize_live_output="true"` and server-set `normalization_encoder="cpu"` or
+`"vaapi"`; client metadata cannot override either marker. No
+`transcoding="true"` marker is injected, so
 ordinary-direct editor pooling can still find it.
 
 Only the outer ID is needed for management. `POST /streams/{id}/failover` routes
@@ -67,7 +69,23 @@ codec, track-layout, resolution or protocol switching**; audio and video tracks
 are required. HLS/DASH/VOD remain outside this feature. Repeated failures still
 follow existing retry/exhaustion behavior and may eventually terminate playback.
 
-Optional trusted `LIVE_NORMALIZE_PROFILE` overrides the default below; required
+`normalization_encoder` accepts only `"cpu"` (default) or `"vaapi"`. Missing
+encoder fields, including older channel metadata, mean CPU; there is no GPU
+auto-selection. The field has no effect when normalization is off. Both private
+IDs include the encoder and effective profile, isolating CPU/GPU viewers.
+
+VAAPI requires an accessible Intel `/dev/dri/renderD128` plus an FFmpeg build
+and VAAPI driver supporting `h264_vaapi`. A bounded synthetic upload/encode probe
+runs before allocation; absent/inaccessible/non-Intel hardware or a failed probe
+returns HTTP 503, never silently falls back to CPU. Device loss after creation
+can still end playback. The server-owned template uses software decoding,
+`-vaapi_device /dev/dri/renderD128`, `fps=25,format=nv12,hwupload`,
+`-c:v h264_vaapi -g 25 -bf 0`, and the same audio resampling/AAC, timestamp,
+PMT and reconnect policy as CPU. Hardware decoding is deliberately not enabled
+for source-switch robustness. Clients cannot choose a command or device.
+
+Optional trusted `LIVE_NORMALIZE_PROFILE` overrides the **CPU** default below
+(and is ignored for the fixed VAAPI template); required
 placeholders are `{input_url}` and `{output_args}`, with optional `{format}`.
 Changing the profile creates an isolated stream policy/ID; it does not modify
 already-running encoders. Keep a persistent MPEG-TS pipe output and test any
@@ -81,7 +99,9 @@ Offline acceptance (installed project dependencies; no providers or Emby needed)
 
 ```sh
 python -m pytest tests/test_live_normalization.py -q
-python tools/verify_live_normalization.py
+python tools/verify_live_normalization.py --encoder cpu
+# On an Intel VAAPI host/container with the render node and drivers available:
+python tools/verify_live_normalization.py --encoder vaapi
 ```
 
 The acceptance uses one initial API POST and **one player GET**, faults A's real

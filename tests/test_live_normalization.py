@@ -30,6 +30,14 @@ async def manager(monkeypatch):
     await sm.stop()
 
 
+@pytest.fixture(params=["cpu", "vaapi"])
+def encoder_policy(request, monkeypatch):
+    import live_normalization
+
+    monkeypatch.setattr(live_normalization, "validate_vaapi_encoder", AsyncMock())
+    return request.param
+
+
 def scope():
     return Request(
         {
@@ -65,6 +73,7 @@ async def test_owned_identity_metadata_reuse_and_selected_backup(manager):
     )
     assert inner.metadata["original_channel_id"] == "8"
     assert outer.metadata["normalize_live_output"] == "true"
+    assert outer.metadata["normalization_encoder"] == "cpu"
     assert "transcoding" not in outer.metadata
     assert outer.original_url.startswith("http://127.0.0.1:12345/stream/")
     inner.current_url = inner.failover_urls[0]
@@ -175,10 +184,10 @@ async def test_partial_failure_rolls_back(
 
 
 @pytest.mark.asyncio
-async def test_idle_cascade_and_metadata_cannot_forge_ownership(manager):
+async def test_idle_cascade_and_metadata_cannot_forge_ownership(manager, encoder_policy):
     from datetime import datetime, timezone, timedelta
 
-    result = await api.create_stream(payload(normalize_live_output=True), scope())
+    result = await api.create_stream(payload(normalize_live_output=True, normalization_encoder=encoder_policy), scope())
     outer = manager.streams[result["stream_id"]]
     inner = manager.normalization_source(outer)
     foreign = await manager.get_or_create_stream(
@@ -246,8 +255,8 @@ async def test_active_input_retained_and_concurrent_posts_share_encoder(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("oldest", [False, True])
-async def test_metadata_delete_counts_one_and_cascades(manager, oldest):
-    result = await api.create_stream(payload(normalize_live_output=True), scope())
+async def test_metadata_delete_counts_one_and_cascades(manager, oldest, encoder_policy):
+    result = await api.create_stream(payload(normalize_live_output=True, normalization_encoder=encoder_policy), scope())
     outer = manager.streams[result["stream_id"]]
     inner = manager.normalization_source(outer)
     if oldest:
@@ -315,7 +324,7 @@ async def test_private_profile_policy_id_and_ownership_not_metadata(
 
 
 @pytest.mark.asyncio
-async def test_owned_input_delete_rejected_without_disrupting_outer(manager, monkeypatch):
+async def test_owned_input_delete_rejected_without_disrupting_outer(manager, monkeypatch, encoder_policy):
     import httpx
 
     monkeypatch.setattr(settings, "API_TOKEN", "offline-fixture-only")
@@ -331,7 +340,7 @@ async def test_owned_input_delete_rejected_without_disrupting_outer(manager, mon
         unrelated = manager.streams[raw["stream_id"]]
         await manager.register_client("unrelated", unrelated.stream_id, "test", "127.0.0.1")
         created = await client.post(
-            "/streams", json=payload(normalize_live_output=True).model_dump()
+            "/streams", json=payload(normalize_live_output=True, normalization_encoder=encoder_policy).model_dump()
         )
         assert created.status_code == 200
         outer = manager.streams[created.json()["stream_id"]]
