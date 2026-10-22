@@ -99,6 +99,72 @@ cases plus the three real QSV API captures. Host-side `ruff check src tests` and
 `git diff --check` also passed (the sandbox image does not contain Ruff; no
 package was installed). All owned validation containers were removed.
 
+## Handoff cadence recheck (finite transport helper, not API acceptance)
+
+`329463e` already contains `-fflags +genpts+discardcorrupt`. No QSV source
+profile/filter change or timestamp rewrite was needed for the retained original
+1077-frame handoff fixture. Changing **only** that flag to `+genpts` reproduced
+three bad 90 kHz video deltas, `[1, 1, 3598]`, and two mux DTS clamps. Keeping the
+existing flag produced all 1077 frames at 3600 ticks, no clamps, and one clock
+recovery rather than three audio/video discontinuity corrections. This proves
+the missing-flag mechanism; it does not establish which flags were in an earlier
+RAM-only profile invocation whose complete arguments were not retained.
+
+The new opt-in `tests/test_qsv_cadence_handoff.py` exercises moving 320x180 p25,
+p50 and TFF-i25, changed PMT and elementary PIDs, A at offset 20 s and B at 0 s,
+997-byte feed chunks, finite A EOF and fully drained B. It imports the product
+`ts_canonicalizer` if present; on this branch it uses an owned external helper via
+`QSV_CADENCE_HELPER`, without copying that module into product sources.
+
+The complete-video cut has **126 / 251 / 252** expected and distinct output
+frames (p25 / p50 / i25), with exact 40 / 20 / 20 ms intervals. A second cut
+inside an audio PES has **122 / 259 / 260** expected/distinct frames: FFmpeg
+explicitly reports dropping corrupt audio, with only one clock recovery, no mux
+clamps and unchanged video cadence. Both 440/880 Hz tones were verified; audio
+packet continuity residual was at most 1 microsecond, initial audio lead 42.667 ms,
+and final A/V difference below 27 ms. **PCM silence at the handoff is real:**
+140–160 ms for the clean-video cuts and 300–320 ms when an incomplete AAC PES is
+dropped. Do not label these cuts seamless/inaudible. Per-frame minimum SSIM was
+at least 0.993540 across these passing cases; every output frame matched its
+own independent reference position better than either of its two neighbours.
+
+A deliberate truncated-video cut exposes a separate transport limitation:
+with the muxer's default zero video PES length, `discardcorrupt` cannot infer
+that the final PES is incomplete. QSV conceals it, giving **127 vs 126**, **252 vs
+251**, and **254 vs 252** frames. These three strict tests remain **red**, not
+xfail and not relaxed. A one-variable source control with
+`-omit_video_pes_length 0` gives explicit nonzero PES lengths and passes all
+nine moving combinations, including exact **126 / 251 / 252** truncated-video
+outputs. Those cases intentionally discard one damaged source video PES, not
+"zero source-frame drops". Source PES-length selection is a diagnostic fixture
+control, **not** a proposed live-source workaround.
+
+The final all-flags sandbox run returned **530 passed, 3 failed, 0 skipped**
+(105 existing warnings); the failures are exactly the unbounded truncated-video
+PES gates above. CPU/VAAPI/QSV finite-quality and real fixed-source QSV API tests
+were included and passed. `ruff check src tests` passed. This is not a green
+handoff release gate: complete-PES gating for unbounded video belongs to the
+transport workstream and remains unresolved. No `setpts`, fixed output fps,
+encoder frame-dropping policy or source-profile mutation was introduced.
+
+Retained fixtures, generated sources/outputs, debug logs, JUnit XML, per-case
+metrics and control results are outside the repository under:
+
+```text
+/opt/data/profiles/infra/workspace/m3u-live-failover/optin-acceptance/qsv-check/cadence-fix/resumed-evidence/
+```
+
+Reproduce only in an owned network-none Intel render-node sandbox, serially:
+
+```sh
+PYTHONPATH=src RUN_QSV_CADENCE=1 QSV_CADENCE_HELPER=/lab/helper \
+QSV_CADENCE_CONTROL=/lab/canonical.ts RUN_QSV_QUALITY=1 RUN_VAAPI_QUALITY=1 \
+NORMALIZATION_QUALITY_SIZE=320x180 python -m pytest tests -q --tb=short
+```
+
+`QSV_CADENCE_CONTROL` is optional and specifically names the retained original
+1077-frame synthetic fixture; the moving cases regenerate their own inputs.
+
 ## Limits
 
 These are synthetic correctness/regression checks, not provider/client visual
