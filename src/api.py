@@ -13,6 +13,7 @@ from typing import Optional, List, Dict, Literal
 from pydantic import BaseModel, field_validator
 from datetime import datetime, timezone
 import os
+import platform
 
 from stream_manager import StreamManager, DashProcessor
 from events import EventManager
@@ -673,6 +674,7 @@ async def get_info():
     # Build the info response
     info = {
         "version": VERSION,
+        "python_version": platform.python_version(),
         "ffmpeg_version": get_ffmpeg_version(),
         "streamlink_version": get_resolver_version("streamlink")
         if settings.STREAMLINK_ENABLED
