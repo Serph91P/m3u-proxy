@@ -198,12 +198,16 @@ async def test_identity_is_scoped_to_this_process(redis_manager, monkeypatch):
     # Instances sharing Redis must not resolve to one encoder key: the owned input
     # is only reachable over this process's loopback.
     first = await api.create_stream(payload(normalize_live_output=True), scope())
-    other = StreamManager(redis_url="redis://unused.invalid:6379/6", enable_pooling=True)
+    other = StreamManager(
+        redis_url="redis://unused.invalid:6379/6", enable_pooling=True
+    )
     try:
         monkeypatch.setattr(api, "stream_manager", other)
         second = await api.create_stream(payload(normalize_live_output=True), scope())
         assert second["stream_id"] != first["stream_id"]
-        first_input = redis_manager.normalization_source(redis_manager.streams[first["stream_id"]])
+        first_input = redis_manager.normalization_source(
+            redis_manager.streams[first["stream_id"]]
+        )
         second_input = other.normalization_source(other.streams[second["stream_id"]])
         assert first_input.stream_id != second_input.stream_id
         # The transcoder profile itself is unchanged (QSV diagnostics match on it).
@@ -250,15 +254,23 @@ async def test_partial_failure_rolls_back(
 
     monkeypatch.setattr(manager, "get_or_create_stream", create)
     with pytest.raises(asyncio.CancelledError if cancel else HTTPException):
-        await api.create_stream(payload(normalize_live_output=True, normalization_encoder=encoder_policy), scope())
+        await api.create_stream(
+            payload(normalize_live_output=True, normalization_encoder=encoder_policy),
+            scope(),
+        )
     assert not manager.streams
 
 
 @pytest.mark.asyncio
-async def test_idle_cascade_and_metadata_cannot_forge_ownership(manager, encoder_policy):
+async def test_idle_cascade_and_metadata_cannot_forge_ownership(
+    manager, encoder_policy
+):
     from datetime import datetime, timezone, timedelta
 
-    result = await api.create_stream(payload(normalize_live_output=True, normalization_encoder=encoder_policy), scope())
+    result = await api.create_stream(
+        payload(normalize_live_output=True, normalization_encoder=encoder_policy),
+        scope(),
+    )
     outer = manager.streams[result["stream_id"]]
     inner = manager.normalization_source(outer)
     foreign = await manager.get_or_create_stream(
@@ -327,7 +339,10 @@ async def test_active_input_retained_and_concurrent_posts_share_encoder(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("oldest", [False, True])
 async def test_metadata_delete_counts_one_and_cascades(manager, oldest, encoder_policy):
-    result = await api.create_stream(payload(normalize_live_output=True, normalization_encoder=encoder_policy), scope())
+    result = await api.create_stream(
+        payload(normalize_live_output=True, normalization_encoder=encoder_policy),
+        scope(),
+    )
     outer = manager.streams[result["stream_id"]]
     inner = manager.normalization_source(outer)
     if oldest:
@@ -395,7 +410,9 @@ async def test_private_profile_policy_id_and_ownership_not_metadata(
 
 
 @pytest.mark.asyncio
-async def test_owned_input_delete_rejected_without_disrupting_outer(manager, monkeypatch, encoder_policy):
+async def test_owned_input_delete_rejected_without_disrupting_outer(
+    manager, monkeypatch, encoder_policy
+):
     import httpx
 
     monkeypatch.setattr(settings, "API_TOKEN", "offline-fixture-only")
@@ -409,9 +426,14 @@ async def test_owned_input_delete_rejected_without_disrupting_outer(manager, mon
     ) as client:
         raw = await api.create_stream(payload(), scope())
         unrelated = manager.streams[raw["stream_id"]]
-        await manager.register_client("unrelated", unrelated.stream_id, "test", "127.0.0.1")
+        await manager.register_client(
+            "unrelated", unrelated.stream_id, "test", "127.0.0.1"
+        )
         created = await client.post(
-            "/streams", json=payload(normalize_live_output=True, normalization_encoder=encoder_policy).model_dump()
+            "/streams",
+            json=payload(
+                normalize_live_output=True, normalization_encoder=encoder_policy
+            ).model_dump(),
         )
         assert created.status_code == 200
         outer = manager.streams[created.json()["stream_id"]]

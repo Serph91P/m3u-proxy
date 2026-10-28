@@ -41,22 +41,42 @@ VAAPI_PROFILE = (
 # Hardware decoding conceals truncated unbounded H.264 PES despite explode/ec=0.
 # This is a static correctness-first preset, not a runtime software fallback.
 QSV_DEVICE_ARGS = (
-    "-init_hw_device", "vaapi=va:/dev/dri/renderD128",
-    "-init_hw_device", "qsv=qs@va", "-filter_hw_device", "qs",
+    "-init_hw_device",
+    "vaapi=va:/dev/dri/renderD128",
+    "-init_hw_device",
+    "qsv=qs@va",
+    "-filter_hw_device",
+    "qs",
 )
 # Strict H.264 recovery can loop on an initial broken access unit with frame
 # threading. Serialize only this software input decoder, not the QSV encoder.
 QSV_DECODING_ARGS = (
-    "-hwaccel", "none", "-err_detect:v", "explode", "-ec:v", "0",
-    "-threads:v", "1",
+    "-hwaccel",
+    "none",
+    "-err_detect:v",
+    "explode",
+    "-ec:v",
+    "0",
+    "-threads:v",
+    "1",
 )
 QSV_FILTER = (
     "bwdif=mode=send_field:parity=auto:deint=interlaced,"
     "format=nv12,hwupload=extra_hw_frames=64"
 )
 QSV_ENCODING_ARGS = (
-    "-fps_mode", "passthrough", "-enc_time_base", "1/90000",
-    "-c:v", "h264_qsv", "-global_quality", "18", "-g", "25", "-bf", "0",
+    "-fps_mode",
+    "passthrough",
+    "-enc_time_base",
+    "1/90000",
+    "-c:v",
+    "h264_qsv",
+    "-global_quality",
+    "18",
+    "-g",
+    "25",
+    "-bf",
+    "0",
 )
 QSV_PROFILE = (
     " ".join(QSV_DEVICE_ARGS) + " "
@@ -65,8 +85,7 @@ QSV_PROFILE = (
     "-reconnect_delay_max 2 -reconnect_max_retries 5 "
     "-fflags +genpts+discardcorrupt -merge_pmt_versions 1 "
     "-dts_delta_threshold 1 " + " ".join(QSV_DECODING_ARGS) + " -i {input_url} "
-    "-map 0:v:0 -map 0:a:0 -vf " + QSV_FILTER + " "
-    + " ".join(QSV_ENCODING_ARGS) + " "
+    "-map 0:v:0 -map 0:a:0 -vf " + QSV_FILTER + " " + " ".join(QSV_ENCODING_ARGS) + " "
     "-af aresample=async=1:first_pts=0 -c:a aac -b:a 128k "
     "-f mpegts {output_args}"
 )
@@ -84,21 +103,57 @@ async def validate_qsv_encoder():
     fixture = None
     commands = (
         (
-            "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=50:duration=0.16",
-            "-vf", "tinterlace=mode=interleave_top,setfield=tff",
-            "-frames:v", "4", "-c:v", "libx264", "-preset", "ultrafast",
-            "-crf", "18", "-pix_fmt", "yuv420p", "-flags", "+ilme+ildct",
-            "-x264-params", "tff=1", "-an", "-f", "mpegts", "pipe:1",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=50:duration=0.16",
+            "-vf",
+            "tinterlace=mode=interleave_top,setfield=tff",
+            "-frames:v",
+            "4",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-flags",
+            "+ilme+ildct",
+            "-x264-params",
+            "tff=1",
+            "-an",
+            "-f",
+            "mpegts",
+            "pipe:1",
         ),
-        (*QSV_DEVICE_ARGS, *QSV_DECODING_ARGS, "-fflags", "+genpts+discardcorrupt",
-         "-i", "pipe:0", "-vf", QSV_FILTER,
-         *QSV_ENCODING_ARGS, "-an", "-f", "null", "-"),
+        (
+            *QSV_DEVICE_ARGS,
+            *QSV_DECODING_ARGS,
+            "-fflags",
+            "+genpts+discardcorrupt",
+            "-i",
+            "pipe:0",
+            "-vf",
+            QSV_FILTER,
+            *QSV_ENCODING_ARGS,
+            "-an",
+            "-f",
+            "null",
+            "-",
+        ),
     )
     for index, command in enumerate(commands):
         process = None
         try:
             process = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-v", "error", "-nostdin", *command,
+                "ffmpeg",
+                "-hide_banner",
+                "-v",
+                "error",
+                "-nostdin",
+                *command,
                 stdin=asyncio.subprocess.PIPE if index else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL if index else asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -111,7 +166,9 @@ async def validate_qsv_encoder():
             if index == 0:
                 fixture = output
         except (OSError, asyncio.TimeoutError) as exc:
-            raise HTTPException(503, "Intel QSV H.264 pipeline probe unavailable") from exc
+            raise HTTPException(
+                503, "Intel QSV H.264 pipeline probe unavailable"
+            ) from exc
         finally:
             if process is not None and process.returncode is None:
                 process.kill()
@@ -122,7 +179,10 @@ def _intel_device_available():
     try:
         return (
             stat.S_ISCHR(Path(VAAPI_DEVICE).stat().st_mode)
-            and Path("/sys/class/drm/renderD128/device/vendor").read_text().strip().lower()
+            and Path("/sys/class/drm/renderD128/device/vendor")
+            .read_text()
+            .strip()
+            .lower()
             == "0x8086"
         )
     except OSError:
@@ -140,16 +200,39 @@ async def validate_vaapi_encoder():
     process = None
     try:
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-v", "error", "-nostdin",
-            "-vaapi_device", VAAPI_DEVICE,
-            "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25",
-            "-frames:v", "1", "-vf",
+            "ffmpeg",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-nostdin",
+            "-vaapi_device",
+            VAAPI_DEVICE,
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=25",
+            "-frames:v",
+            "1",
+            "-vf",
             "bwdif=mode=send_field:parity=auto:deint=interlaced,format=nv12,hwupload",
-            "-fps_mode", "passthrough",
-            "-c:v", "h264_vaapi", "-rc_mode", "CQP", "-qp", "18",
-            "-bf", "0", "-g", "25",
-            "-an", "-f", "null", "-",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "h264_vaapi",
+            "-rc_mode",
+            "CQP",
+            "-qp",
+            "18",
+            "-bf",
+            "0",
+            "-g",
+            "25",
+            "-an",
+            "-f",
+            "null",
+            "-",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         await asyncio.wait_for(process.wait(), timeout=10)
         if process.returncode != 0:
@@ -202,9 +285,7 @@ async def create_normalized_stream(manager, payload, request):
         parameters = QSV_PROFILE
     try:
         fields = {
-            name
-            for _, name, _, _ in Formatter().parse(parameters)
-            if name is not None
+            name for _, name, _, _ in Formatter().parse(parameters) if name is not None
         }
         if not {"input_url", "output_args"}.issubset(fields) or fields - {
             "input_url",
@@ -223,13 +304,14 @@ async def create_normalized_stream(manager, payload, request):
     )
     # Include the effective normalizer profile in both private identities.
     salt = (
-        f"live-normalize:{encoder}:"
-        + hashlib.sha256(parameters.encode()).hexdigest()
+        f"live-normalize:{encoder}:" + hashlib.sha256(parameters.encode()).hexdigest()
     )
     # And this process: the owned input is only reachable here, so an instance sharing
     # Redis runs its own encoder instead of finding this one and refusing to start.
     identity = f"{salt}:{manager.pooled_manager.worker_id}"
-    options = payload.model_dump(exclude={"url", "normalize_live_output", "normalization_encoder"})
+    options = payload.model_dump(
+        exclude={"url", "normalize_live_output", "normalization_encoder"}
+    )
     options.update(
         strict_live_ts=True,
         use_sticky_session=True,

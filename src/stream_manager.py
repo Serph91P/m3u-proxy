@@ -1904,9 +1904,9 @@ class StreamManager:
             )
         configured_max = settings.MAX_FAILOVER_ATTEMPTS
         request = _DirectInputRequest(
-            configured_max if configured_max > 0 else (
-                len(info.failover_urls) if info.failover_urls else 999
-            )
+            configured_max
+            if configured_max > 0
+            else (len(info.failover_urls) if info.failover_urls else 999)
         )
         response = await self._stream_continuous_direct_original(
             stream_id, client_id, range_header, _input_request=request
@@ -1925,6 +1925,7 @@ class StreamManager:
             source = original
             epoch = initial_epoch
             connection_id = initial_connection_id
+
             def request_is_active():
                 return request.is_active(self.clients, client_id)
 
@@ -1972,11 +1973,14 @@ class StreamManager:
                                 # late errors therefore end this input cleanly.
                                 if (
                                     not output_started
-                                    and (info.failover_resolver_url or info.failover_urls)
+                                    and (
+                                        info.failover_resolver_url or info.failover_urls
+                                    )
                                     and request.reserve_failover()
                                 ):
                                     recovered = await self._update_failover_url(
-                                        stream_id, "normalization_input_error",
+                                        stream_id,
+                                        "normalization_input_error",
                                         expected_generation=epoch,
                                     )
                                 if (
@@ -1994,7 +1998,9 @@ class StreamManager:
                                     and self._direct_broadcast_primary.get(stream_id)
                                     == connection_id
                                 ):
-                                    await self._detach_direct_generation(stream_id, connection_id)
+                                    await self._detach_direct_generation(
+                                        stream_id, connection_id
+                                    )
                                 else:
                                     info.direct_generation += 1
                                 if not recovered:
@@ -2043,8 +2049,12 @@ class StreamManager:
         return response
 
     async def _stream_continuous_direct_original(
-        self, stream_id: str, client_id: str, range_header: Optional[str] = None,
-        *, _input_request: Optional[_DirectInputRequest] = None,
+        self,
+        stream_id: str,
+        client_id: str,
+        range_header: Optional[str] = None,
+        *,
+        _input_request: Optional[_DirectInputRequest] = None,
     ) -> StreamingResponse:
         """
         Direct byte-for-byte proxy for continuous streams (.ts, .mp4, .mkv).
@@ -2111,7 +2121,10 @@ class StreamManager:
             # Transport and adapter selectors spend the same response budget.
             # Recheck after lock acquisition; stale readers must not select again.
             async with stream_info.direct_recovery_lock:
-                if not input_request_is_active() or not _input_request.reserve_failover():
+                if (
+                    not input_request_is_active()
+                    or not _input_request.reserve_failover()
+                ):
                     return False
                 recovered = await self._update_failover_url(
                     selected_stream_id, reason, expected_generation=generation
@@ -2157,9 +2170,7 @@ class StreamManager:
                     stream_info.failover_resolver_url or stream_info.failover_urls
                 )
                 if has_failover:
-                    await select_failover(
-                        stream_id, "circuit_breaker_bad_upstream"
-                    )
+                    await select_failover(stream_id, "circuit_breaker_bad_upstream")
                     current_url = stream_info.current_url or stream_info.original_url
                     # Clear the bad marker since we switched to a new upstream
                     stream_info.upstream_marked_bad_until = None
@@ -2683,11 +2694,9 @@ class StreamManager:
                                                 f"Retries exhausted, attempting failover due to chunk timeout for client {client_id} "
                                                 f"(failover attempt {failover_count + 1}/{max_failovers})"
                                             )
-                                            failover_ok = (
-                                                await select_failover(
-                                                    stream_id,
-                                                    "chunk_timeout_after_retries",
-                                                )
+                                            failover_ok = await select_failover(
+                                                stream_id,
+                                                "chunk_timeout_after_retries",
                                             )
                                             failover_count += 1
                                             if not failover_ok:
@@ -4096,6 +4105,7 @@ class StreamManager:
 
         # Capture ownership before disconnect/delete can remove the outer stream.
         qsv_owned_input = self._is_qsv_owned_input(stream_info)
+
         # Create new generator that yields the first chunk then continues with the rest
         async def generate_with_first_chunk():
             try:
@@ -5783,8 +5793,11 @@ class StreamManager:
         return await self._update_failover_url(stream_id, reason)
 
     async def _update_failover_url(
-        self, stream_id: str, reason: str = "manual",
-        *, expected_generation: Optional[int] = None,
+        self,
+        stream_id: str,
+        reason: str = "manual",
+        *,
+        expected_generation: Optional[int] = None,
     ) -> bool:
         """Update to next failover URL and signal all clients to reconnect
 

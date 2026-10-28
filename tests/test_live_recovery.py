@@ -548,7 +548,10 @@ async def test_api_nullable_forwarding_and_unsupported_topology(manager, monkeyp
         assert enabled.json()["stream_id"] != disabled.json()["stream_id"]
         monkeypatch.setenv("WEB_CONCURRENCY", "2")
         result = await client.post("/streams", json={"url": B})
-        assert result.status_code == 400 and "one server process" in result.json()["detail"]
+        assert (
+            result.status_code == 400
+            and "one server process" in result.json()["detail"]
+        )
 
 
 @pytest.mark.asyncio
