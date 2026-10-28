@@ -14,7 +14,7 @@ from string import Formatter
 from fastapi import HTTPException
 
 from config import settings
-from redis_config import should_use_pooling
+from redis_config import shares_listener_with_workers, should_use_pooling
 from transcoding import get_profile_manager
 
 
@@ -170,20 +170,22 @@ async def create_normalized_stream(manager, payload, request):
         for url in urls
     ):
         raise HTTPException(400, "Live normalization supports direct live MPEG-TS only")
-    try:
-        available = (
-            not settings.REDIS_ENABLED
-            and not manager._redis_requested
-            and settings.ENABLE_SINGLE_PROCESS_TRANSCODING
-            and should_use_pooling()
-            and manager.pooled_manager is not None
+    # FFmpeg reads the owned input back over 127.0.0.1, so it must reach this process.
+    # Redis pooling and separate WORKER_ID instances qualify; sibling workers on one
+    # port do not.
+    if shares_listener_with_workers():
+        raise HTTPException(
+            400, "Live normalization requires one server process per proxy instance"
         )
+    try:
+        available = should_use_pooling() and manager.pooled_manager is not None
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not available:
         raise HTTPException(
             400,
-            "Live normalization requires single-process transcoding pooling without Redis",
+            "Live normalization requires transcoding pooling: Redis, or "
+            "ENABLE_SINGLE_PROCESS_TRANSCODING=true",
         )
 
     # Do not trust Host/forwarded headers. The socket's server port is authoritative.
@@ -224,6 +226,9 @@ async def create_normalized_stream(manager, payload, request):
         f"live-normalize:{encoder}:"
         + hashlib.sha256(parameters.encode()).hexdigest()
     )
+    # And this process: the owned input is only reachable here, so an instance sharing
+    # Redis runs its own encoder instead of finding this one and refusing to start.
+    identity = f"{salt}:{manager.pooled_manager.worker_id}"
     options = payload.model_dump(exclude={"url", "normalize_live_output", "normalization_encoder"})
     options.update(
         strict_live_ts=True,
@@ -235,7 +240,7 @@ async def create_normalized_stream(manager, payload, request):
         before = set(manager.streams)
         try:
             inner_id = await manager.get_or_create_stream(
-                payload.url, **options, identity_salt=salt
+                payload.url, **options, identity_salt=identity
             )
             inner = manager.streams[inner_id]
             # No recycling/restarting an existing owned encoder or selected B.
@@ -257,7 +262,7 @@ async def create_normalized_stream(manager, payload, request):
                 is_transcoded=True,
                 transcode_profile=salt,
                 transcode_ffmpeg_args=args,
-                identity_salt=salt,
+                identity_salt=identity,
             )
             outer = manager.streams[outer_id]
             outer.normalization_input_id = inner_id

@@ -23,6 +23,7 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from config import settings
+from redis_config import shares_listener_with_workers
 from ts_overlap import OverlapTrimmer, TRIM_MATCHED, TRIM_NO_MATCH
 from ts_canonicalizer import TSCanonicalizer, TSCanonicalizationError
 from url_signing import sign_url, verify_url
@@ -846,12 +847,13 @@ class StreamManager:
             if single_recovery_per_exit is None
             else single_recovery_per_exit
         )
-        if (end_session or single_recovery) and (
-            settings.REDIS_ENABLED or settings.WORKER_ID or self._redis_requested
-        ):
+        # Direct streams and their recovery state never leave this process (Redis only
+        # coordinates transcoders), so Redis and separate WORKER_ID instances are fine.
+        # Sibling workers on the same port are not: a request can reach the wrong one.
+        if (end_session or single_recovery) and shares_listener_with_workers():
             raise HTTPException(
                 status_code=400,
-                detail="Live recovery policies require a single process without Redis/WORKER_ID",
+                detail="Live recovery policies require one server process per proxy instance",
             )
 
         # Include transcoding info in the stream ID so that a direct stream and
