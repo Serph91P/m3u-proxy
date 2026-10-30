@@ -61,3 +61,20 @@ def test_version_lookup_runs_off_the_event_loop():
     assert version == "yt-dlp 1.0"
     assert reader_threads and reader_threads[0] != loop_thread
     assert ticks == 3
+
+
+def test_info_does_not_expose_redis_password():
+    api._binary_versions.update(
+        {"ffmpeg": "ffmpeg 7.1", "streamlink": "streamlink 7", "yt-dlp": "yt-dlp 1"}
+    )
+    redis_config = {"host": "redis", "port": 6379, "password": "s3cret", "db": 0}
+
+    with (
+        patch.object(api.settings, "REDIS_ENABLED", True),
+        patch.object(api, "get_redis_config", return_value=redis_config),
+    ):
+        info = asyncio.run(api.get_info())
+
+    assert info["redis"]["host"] == "redis"
+    assert "password" not in info["redis"]
+    assert "s3cret" not in str(info)
