@@ -5002,6 +5002,8 @@ class StreamManager:
                 # Use the parent's current URL as this variant's URL
                 # The parent URL should be the master playlist after failover
                 stream_info.current_url = parent_info.current_url
+                # Inherit authorization, not the possibly redirected current origin.
+                stream_info.media_header_origin = parent_info.media_header_origin
                 # Also update original_url so future checks work correctly
                 stream_info.original_url = parent_info.current_url
 

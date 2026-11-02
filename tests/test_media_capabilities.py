@@ -338,6 +338,78 @@ async def test_independent_workers_need_the_issuing_stream_context(playback):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ["explicit-failover", "sticky-redirect"])
+async def test_issued_variant_replays_with_only_authorized_parent_origin(
+    playback, transition
+):
+    client, manager, _, captured = playback
+    provider_headers = {
+        "Authorization": "Bearer synthetic-variant",
+        "X-Provider-Key": "synthetic-variant",
+    }
+    provider_agent = "synthetic-variant-agent"
+    redirect_parent = False
+
+    def upstream(request):
+        captured.append((str(request.url), dict(request.headers)))
+        if request.url.host == "a.test" and request.url.path == "/master.m3u8":
+            if redirect_parent:
+                return httpx.Response(
+                    302, headers={"Location": "http://b.test/index.m3u8"}
+                )
+            body = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nchild.m3u8\n"
+        elif request.url.path.endswith(".m3u8"):
+            if (
+                request.url.host == "b.test"
+                and transition == "explicit-failover"
+                and request.headers.get("user-agent") != provider_agent
+            ):
+                return httpx.Response(401)
+            body = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nseg.ts\n"
+        else:
+            return httpx.Response(200, content=b"synthetic-media")
+        return httpx.Response(200, text=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as source:
+        manager.http_client = source
+        parent = await manager.get_or_create_stream(
+            "http://a.test/master.m3u8",
+            user_agent=provider_agent,
+            headers=provider_headers,
+            failover_urls=["http://b.test/index.m3u8"],
+            use_sticky_session=True,
+        )
+        variant_link = (await hls_links(client, parent))[0]
+        assert (await client.get(variant_link)).status_code == 200
+        if transition == "explicit-failover":
+            assert await manager._try_update_failover_url(parent, "synthetic-variant")
+        else:
+            redirect_parent = True
+        await hls_links(client, parent)
+        captured.clear()
+        response = await client.get(variant_link)
+        assert response.status_code == 200
+        segment_link = next(
+            line for line in response.text.splitlines() if "/segment" in line
+        )
+        segment = await client.get(segment_link)
+        assert segment.status_code == 200 and segment.content == b"synthetic-media"
+        assert [url for url, _ in captured] == [
+            "http://b.test/index.m3u8",
+            "http://b.test/seg.ts",
+        ]
+        for _, headers in captured:
+            if transition == "explicit-failover":
+                assert headers["user-agent"] == provider_agent
+                assert headers["authorization"] == provider_headers["Authorization"]
+                assert headers["x-provider-key"] == provider_headers["X-Provider-Key"]
+            else:
+                assert headers["user-agent"] == api.settings.DEFAULT_USER_AGENT
+                assert "authorization" not in headers
+                assert "x-provider-key" not in headers
+
+
+@pytest.mark.asyncio
 async def test_failover_issues_new_links_without_changing_old_header_scope(playback):
     client, manager, (a, _), captured = playback
     manager.streams[a].failover_urls = ["http://b.test/index.m3u8"]
