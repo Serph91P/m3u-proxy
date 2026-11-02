@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from starlette.responses import StreamingResponse
 
 import api
+from tests.media_helpers import bind_media_context
 from stream_manager import DashProcessor, M3U8Processor, StreamManager
 from url_signing import sign_url, verify_url
 
@@ -63,7 +64,11 @@ class TestSigning:
         assert len(lines) == 2
         for line in lines:
             params = _query(line)
-            assert verify_url(params["url"], params["sig"])
+            assert verify_url(
+                params["url"],
+                params["sig"],
+                role="hls-segment" if "/segment" in line else "hls-playlist:s1",
+            )
 
     def test_variant_playlist_links_are_signed(self):
         processor = M3U8Processor("/hls/s1", "client-1", parent_stream_id="s1")
@@ -75,7 +80,11 @@ class TestSigning:
         assert len(lines) == 2
         for line in lines:
             params = _query(line)
-            assert verify_url(params["url"], params["sig"])
+            assert verify_url(
+                params["url"],
+                params["sig"],
+                role="hls-segment" if "/segment" in line else "hls-playlist:s1",
+            )
 
     def test_dash_base_token_round_trip_and_tamper(self):
         base = "https://upstream.example.com/live/"
@@ -98,7 +107,7 @@ def mocked_client():
         yield b"segment-bytes"
 
     with patch("api.stream_manager") as sm, patch("api.event_manager") as em:
-        sm.streams = {}
+        bind_media_context(sm, "x", "s1")
         sm.clients = {}
         sm.register_client = AsyncMock()
         sm.proxy_hls_segment = AsyncMock(
@@ -146,7 +155,9 @@ class TestHlsSegmentRoute:
             params={
                 "client_id": "a",
                 "url": "/etc/passwd",
-                "sig": sign_url(UPSTREAM_SEGMENT),
+                "sig": sign_url(
+                    UPSTREAM_SEGMENT, context=sm.media_context("x"), role="hls-segment"
+                ),
             },
         )
 
@@ -160,7 +171,9 @@ class TestHlsSegmentRoute:
             params={
                 "client_id": "a",
                 "url": UPSTREAM_SEGMENT,
-                "sig": sign_url(UPSTREAM_SEGMENT),
+                "sig": sign_url(
+                    UPSTREAM_SEGMENT, context=sm.media_context("x"), role="hls-segment"
+                ),
             },
         )
 
@@ -191,7 +204,9 @@ class TestDashRoutes:
     )
     def test_segment_route_keeps_signed_host(self, mocked_client, path):
         client, sm = mocked_client
-        token = DashProcessor.sign_base("https://upstream.example.com/live/")
+        token = DashProcessor.sign_base(
+            "https://upstream.example.com/live/", sm.media_context("x")
+        )
         resp = client.get(f"/dash/x/segment/a/{token}/{path}")
 
         assert resp.status_code == 403
@@ -199,7 +214,9 @@ class TestDashRoutes:
 
     def test_segment_route_proxies_signed_base(self, mocked_client):
         client, sm = mocked_client
-        token = DashProcessor.sign_base("https://upstream.example.com/live/")
+        token = DashProcessor.sign_base(
+            "https://upstream.example.com/live/", sm.media_context("x")
+        )
         resp = client.get(f"/dash/x/segment/a/{token}/video/seg-1.m4s")
 
         assert resp.status_code == 200
@@ -215,7 +232,9 @@ class TestRewrittenUrlsRoundTrip:
     def test_hls_segment_line_from_playlist_is_accepted(self, mocked_client):
         client, sm = mocked_client
         playlist = "#EXTM3U\n#EXTINF:4.0,\nseg1.ts?token=a%2Bb&exp=1\n"
-        processor = M3U8Processor("/hls/s1", "client-1")
+        processor = M3U8Processor(
+            "/hls/s1", "client-1", signing_context=sm.media_context("s1")
+        )
         result = processor.process_playlist(
             playlist, "/hls/s1", "https://upstream.example.com/live/"
         )
@@ -232,7 +251,9 @@ class TestRewrittenUrlsRoundTrip:
             '<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011">'
             "<BaseURL>https://upstream.example.com/live/</BaseURL><Period/></MPD>"
         )
-        processor = DashProcessor("/dash/s1", "client-1")
+        processor = DashProcessor(
+            "/dash/s1", "client-1", signing_context=sm.media_context("s1")
+        )
         result = processor.process_manifest(
             manifest, "/dash/s1", "https://upstream.example.com/"
         )
@@ -262,7 +283,13 @@ class TestUrlQueryStreamCreation:
         with patch.object(api.settings, "API_TOKEN", "configured-token"):
             resp = client.get(
                 "/hls/x/playlist.m3u8",
-                params={"url": variant, "parent": "x", "sig": sign_url(variant)},
+                params={
+                    "url": variant,
+                    "parent": "x",
+                    "sig": sign_url(
+                        variant, context=sm.media_context("x"), role="hls-playlist:x"
+                    ),
+                },
             )
 
         assert resp.status_code == 200

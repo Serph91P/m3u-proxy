@@ -250,7 +250,7 @@ class TestDashSegmentRoutes:
     are explicit URIs and use the exact HLS `?client_id=` form."""
 
     def _make(self):
-        from unittest.mock import Mock, AsyncMock, patch
+        from unittest.mock import AsyncMock, patch
         from fastapi.testclient import TestClient
         from starlette.responses import StreamingResponse
         import api
@@ -259,7 +259,9 @@ class TestDashSegmentRoutes:
             yield b"\x00\x00\x00\x18ftypmp42"
 
         mock = patch("api.stream_manager").start()
-        mock.streams = {"stream123": Mock()}
+        from tests.media_helpers import bind_media_context
+
+        bind_media_context(mock, "stream123")
         mock.clients = {}
         mock.register_client = AsyncMock()
         mock.proxy_dash_segment = AsyncMock(
@@ -270,7 +272,10 @@ class TestDashSegmentRoutes:
     def test_segment_route_registers_path_client_and_proxies(self):
         client, mock, patcher = self._make()
         try:
-            enc = DashProcessor.sign_base("https://upstream.example.com/live/dash/")
+            enc = DashProcessor.sign_base(
+                "https://upstream.example.com/live/dash/",
+                mock.media_context("stream123"),
+            )
             resp = client.get(f"/dash/stream123/segment/tab-B/{enc}/chunk-1.m4s")
 
             assert resp.status_code == 200
@@ -286,7 +291,9 @@ class TestDashSegmentRoutes:
     def test_pooled_viewers_are_billed_separately_by_their_path_client_id(self):
         client, mock, patcher = self._make()
         try:
-            enc = DashProcessor.sign_base("https://upstream.example.com/live/")
+            enc = DashProcessor.sign_base(
+                "https://upstream.example.com/live/", mock.media_context("stream123")
+            )
             client.get(f"/dash/stream123/segment/tab-A/{enc}/s.m4s")
             billed_a = mock.proxy_dash_segment.call_args.args[1]
             client.get(f"/dash/stream123/segment/tab-B/{enc}/s.m4s")
@@ -304,7 +311,11 @@ class TestDashSegmentRoutes:
                 params={
                     "client_id": "tab-777",
                     "url": "https://upstream.example.com/video/seg1.m4s",
-                    "sig": sign_url("https://upstream.example.com/video/seg1.m4s"),
+                    "sig": sign_url(
+                        "https://upstream.example.com/video/seg1.m4s",
+                        context=mock.media_context("stream123"),
+                        role="dash-file",
+                    ),
                 },
             )
 

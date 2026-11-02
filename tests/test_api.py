@@ -2,6 +2,7 @@
 from stream_manager import StreamManager
 from api import app, get_content_type, is_direct_stream
 from url_signing import sign_url
+from tests.media_helpers import bind_media_context
 import httpx
 import asyncio
 import pytest
@@ -47,7 +48,7 @@ class TestAPI:
     def mock_stream_manager(self):
         with patch("api.stream_manager") as mock:
             # Mock the streams dict to include test_stream_123
-            mock.streams = {"test_stream_123": Mock()}
+            bind_media_context(mock, "test_stream_123")
 
             mock.get_or_create_stream = AsyncMock(return_value="test_stream_123")
             mock.get_stream_info = Mock(
@@ -245,7 +246,11 @@ class TestAPI:
             params={
                 "client_id": "test_client",
                 "url": "http://example.com/segment1.ts",
-                "sig": sign_url("http://example.com/segment1.ts"),
+                "sig": sign_url(
+                    "http://example.com/segment1.ts",
+                    context=mock_stream_manager.media_context("test_stream_123"),
+                    role="hls-segment",
+                ),
             },
         )
         assert response.status_code == 200

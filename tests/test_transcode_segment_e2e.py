@@ -1,16 +1,15 @@
 import sys
 import os
-import tempfile
+
 
 # Add src to path so tests can import the application
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from fastapi.testclient import TestClient
 import api
-from url_signing import sign_url
 
 
-def test_transcode_hls_segment_serving(monkeypatch):
+def test_transcode_hls_segment_serving(monkeypatch, tmp_path):
     """End-to-end test: create a transcoded HLS stream and fetch a local .ts segment via the segment proxy.
 
     The test monkeypatches `api.stream_manager` to use a `StreamManager` whose
@@ -26,7 +25,9 @@ def test_transcode_hls_segment_serving(monkeypatch):
     # Create temp hls dir and write a simple playlist + a small .ts file
     # Same naming as SharedTranscodingProcess output dirs, which are the only
     # local paths the segment route will read
-    tmpdir = tempfile.mkdtemp(prefix="m3u_proxy_hls_test_")
+    tmpdir = str(tmp_path / "m3u_proxy_hls_test")
+    os.mkdir(tmpdir)
+    monkeypatch.setattr(api.settings, "HLS_TEMP_DIR", str(tmp_path))
     playlist_text = """#EXTM3U
 #EXT-X-VERSION:3
 #EXTINF:1.0,
@@ -94,17 +95,11 @@ segment1.ts
     data = resp.json()
     stream_id = data["stream_id"]
 
-    # Build file:// URL for the segment and request it via the segment proxy
-    file_url = f"file://{seg_path}"
-    # Note: api.get_hls_segment expects query params: client_id and url
-    seg_resp = client.get(
-        f"/hls/{stream_id}/segment",
-        params={
-            "client_id": "test_client",
-            "url": file_url,
-            "sig": sign_url(file_url),
-        },
-    )
+    # Replay the processor's actual local-output capability, as a player does.
+    playlist = client.get(f"/hls/{stream_id}/playlist.m3u8")
+    assert playlist.status_code == 200
+    segment = next(line for line in playlist.text.splitlines() if "/segment" in line)
+    seg_resp = client.get(segment)
     assert seg_resp.status_code == 200, seg_resp.text
     # Response content should match the bytes we wrote
     assert seg_resp.content == seg_bytes

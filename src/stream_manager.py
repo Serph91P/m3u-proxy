@@ -9,12 +9,13 @@ import asyncio
 import base64
 import httpx
 import logging
+import json
 import os
 import re
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
-from contextlib import aclosing
+from contextlib import aclosing, asynccontextmanager
 from typing import Dict, Optional, List, Set, Any
 from urllib.parse import urlparse, urljoin, quote
 from datetime import datetime, timezone, timedelta
@@ -26,7 +27,7 @@ from config import settings
 from redis_config import shares_listener_with_workers
 from ts_overlap import OverlapTrimmer, TRIM_MATCHED, TRIM_NO_MATCH
 from ts_canonicalizer import TSCanonicalizer, TSCanonicalizationError
-from url_signing import sign_url, verify_url
+from url_signing import sign_url, verify_url, signature_origin, url_origin
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,10 @@ class StreamInfo:
     direct_recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # Last HTTP error status code from upstream - passed to failover resolver
     last_error_status_code: Optional[int] = None
+    media_generation: str = field(default_factory=lambda: uuid.uuid4().hex)
+    media_local_dir: Optional[str] = None
+    media_header_origin: Optional[str] = None
+    media_parent_context: Optional[str] = field(default=None, repr=False)
 
 
 @dataclass
@@ -197,12 +202,18 @@ class M3U8Processor:
         user_agent: Optional[str] = None,
         original_url: Optional[str] = None,
         parent_stream_id: Optional[str] = None,
+        signing_context: str = "",
+        header_origin: Optional[str] = None,
     ):
         self.base_url = base_url
         self.client_id = client_id
         self.user_agent = user_agent or settings.DEFAULT_USER_AGENT
         self.original_url = original_url or base_url
         self.parent_stream_id = parent_stream_id
+        self.signing_context = signing_context
+        self.header_origin = (
+            url_origin(self.original_url) if header_origin is None else header_origin
+        )
 
     def process_playlist(
         self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None
@@ -282,17 +293,29 @@ class M3U8Processor:
     def _rewrite_url(self, original_url: str, base_proxy_url: str) -> str:
         """Rewrites a URL to point to the proxy, encoding and signing the original URL."""
         encoded_url = quote(original_url, safe="")
-        signature = sign_url(original_url)
+
         # Check path only — strip query params to handle URLs like *.m3u8?location=ABC123
         path = original_url.split("?", 1)[0].lower()
         if path.endswith(".m3u8"):
             # For variant playlists, include parent stream ID
+            signature = sign_url(
+                original_url,
+                context=self.signing_context,
+                role=f"hls-playlist:{self.parent_stream_id or ''}",
+                source_origin=self.header_origin,
+            )
             parent_param = (
                 f"&parent={self.parent_stream_id}" if self.parent_stream_id else ""
             )
             return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}{parent_param}&sig={signature}"
 
         kind = self._segment_kind(original_url)
+        signature = sign_url(
+            original_url,
+            context=self.signing_context,
+            role="hls-segment",
+            source_origin=self.header_origin,
+        )
         return f"{base_proxy_url}/segment.{kind}?url={encoded_url}&client_id={self.client_id}&sig={signature}"
 
 
@@ -316,12 +339,18 @@ class DashProcessor:
         client_id: str,
         user_agent: Optional[str] = None,
         original_url: Optional[str] = None,
+        signing_context: str = "",
+        header_origin: Optional[str] = None,
     ):
         self.base_url = base_url
         self.client_id = client_id
         self.user_agent = user_agent or settings.DEFAULT_USER_AGENT
         self.original_url = original_url or base_url
         self.is_encrypted = False
+        self.signing_context = signing_context
+        self.header_origin = (
+            url_origin(self.original_url) if header_origin is None else header_origin
+        )
 
     @staticmethod
     def encode_base(absolute_base_url: str) -> str:
@@ -335,14 +364,16 @@ class DashProcessor:
         return base64.urlsafe_b64decode(padded.encode()).decode()
 
     @staticmethod
-    def sign_base(absolute_base_url: str) -> str:
+    def sign_base(
+        absolute_base_url: str, context: str = "", source_origin: str = ""
+    ) -> str:
         """Encode an upstream directory URL plus its signature as one path segment
         (`{encoded}.{signature}`; '.' never appears in URL-safe base64)."""
         encoded = DashProcessor.encode_base(absolute_base_url)
-        return f"{encoded}.{sign_url(absolute_base_url)}"
+        return f"{encoded}.{sign_url(absolute_base_url, context=context, role='dash-base', source_origin=source_origin)}"
 
     @staticmethod
-    def verify_base(token: str) -> Optional[str]:
+    def verify_base(token: str, context: str = "") -> Optional[str]:
         """Reverse of sign_base. Returns the upstream base URL, or None when the
         token is malformed or its signature does not match."""
         encoded, _, signature = token.partition(".")
@@ -350,7 +381,13 @@ class DashProcessor:
             absolute_base_url = DashProcessor.decode_base(encoded)
         except ValueError:
             return None
-        return absolute_base_url if verify_url(absolute_base_url, signature) else None
+        return (
+            absolute_base_url
+            if verify_url(
+                absolute_base_url, signature, context=context, role="dash-base"
+            )
+            else None
+        )
 
     def _rewrite_absolute_url(self, absolute_url: str, base_proxy_url: str) -> str:
         # Fully-qualified SegmentList <SegmentURL> entries are explicit URIs the
@@ -358,7 +395,13 @@ class DashProcessor:
         # is byte-for-byte the HLS rewrite (M3U8Processor._rewrite_url):
         # ?url=<encoded>&client_id=<id>&sig=<signature>.
         encoded_url = quote(absolute_url, safe="")
-        return f"{base_proxy_url}/file?url={encoded_url}&client_id={self.client_id}&sig={sign_url(absolute_url)}"
+        signature = sign_url(
+            absolute_url,
+            context=self.signing_context,
+            role="dash-file",
+            source_origin=self.header_origin,
+        )
+        return f"{base_proxy_url}/file?url={encoded_url}&client_id={self.client_id}&sig={signature}"
 
     def _rewrite_base(self, absolute_base_url: str, base_proxy_url: str) -> str:
         # The ONE place DASH cannot match HLS: SegmentTemplate entries are
@@ -367,7 +410,7 @@ class DashProcessor:
         # string - so client_id cannot ride in the query the way it does on an
         # HLS segment line. It goes in the path instead (a path segment is
         # always preserved), so every resolved segment URL still carries it.
-        return f"{base_proxy_url}/segment/{quote(self.client_id, safe='')}/{self.sign_base(absolute_base_url)}/"
+        return f"{base_proxy_url}/segment/{quote(self.client_id, safe='')}/{self.sign_base(absolute_base_url, self.signing_context, self.header_origin)}/"
 
     def process_manifest(
         self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None
@@ -471,6 +514,79 @@ class ShieldedUpstreamReader:
 
 
 class StreamManager:
+    def media_context(self, stream_id: str) -> str:
+        """Private context; a removed/recreated parent revokes all its descendants."""
+        chain = []
+        parent_bindings = []
+        seen = set()
+        while stream_id:
+            info = self.streams.get(stream_id)
+            if info is None or stream_id in seen:
+                return ""
+            seen.add(stream_id)
+            parent_bindings.append(info.media_parent_context)
+            chain.append(
+                [
+                    stream_id,
+                    info.media_generation,
+                    info.user_agent,
+                    sorted(info.headers.items()),
+                    info.media_local_dir,
+                ]
+            )
+            stream_id = info.parent_stream_id
+        for index, binding in enumerate(parent_bindings):
+            if binding is not None and binding != sign_url(
+                "", context=json.dumps(chain[index + 1 :]), role="parent-context"
+            ):
+                return ""
+        return json.dumps(chain) if chain else ""
+
+    def media_headers(
+        self, stream_id: str, url: str, signature: Optional[str], role: str
+    ) -> Dict[str, str]:
+        context = self.media_context(stream_id)
+        if not context or not verify_url(url, signature, context=context, role=role):
+            raise HTTPException(status_code=403, detail="Invalid media capability")
+        info = self.streams[stream_id]
+        headers = {"User-Agent": settings.DEFAULT_USER_AGENT}
+        if url_origin(url) and url_origin(url) == signature_origin(signature):
+            headers["User-Agent"] = info.user_agent
+            headers.update(info.headers)
+        return headers
+
+    async def _media_get(self, url: str, headers: Dict[str, str]):
+        for _ in range(21):
+            response = await self.http_client.get(
+                url, headers=headers, follow_redirects=False
+            )
+            if response.is_redirect is not True or "location" not in response.headers:
+                return response
+            target = urljoin(str(response.url), response.headers["location"])
+            if url_origin(target) != url_origin(url):
+                headers = {"User-Agent": settings.DEFAULT_USER_AGENT}
+            url = target
+        raise httpx.TooManyRedirects("Media redirect limit exceeded")
+
+    @asynccontextmanager
+    async def _media_stream(self, url: str, headers: Dict[str, str]):
+        """Do not forward any configured header across an origin-changing redirect."""
+        for _ in range(21):
+            async with self.http_client.stream(
+                "GET", url, headers=headers, follow_redirects=False
+            ) as response:
+                if not response.is_redirect or "location" not in response.headers:
+                    yield response
+                    return
+                target = urljoin(str(response.url), response.headers["location"])
+                if url_origin(target) != url_origin(url):
+                    headers = {
+                        "User-Agent": settings.DEFAULT_USER_AGENT,
+                        **{k: v for k, v in headers.items() if k.lower() == "range"},
+                    }
+                url = target
+        raise httpx.TooManyRedirects("Media redirect limit exceeded")
+
     def __init__(self, redis_url: Optional[str] = None, enable_pooling: bool = True):
         self.streams: Dict[str, StreamInfo] = {}
         self._normalization_lock = asyncio.Lock()
@@ -884,7 +1000,24 @@ class StreamManager:
         if identity_salt:
             stream_id = hashlib.md5(f"{stream_id}|{identity_salt}".encode()).hexdigest()
 
+        parent_binding = None
+        if parent_stream_id:
+            parent_context = self.media_context(parent_stream_id)
+            if not parent_context:
+                raise HTTPException(status_code=403, detail="Invalid media parent")
+            parent_binding = sign_url("", context=parent_context, role="parent-context")
+            stream_id = hashlib.md5(
+                f"{stream_id}|variant|{parent_binding}".encode()
+            ).hexdigest()
+
         existing = self.streams.get(stream_id)
+        if (
+            existing
+            and parent_binding
+            and existing.media_parent_context == parent_binding
+        ):
+            existing.last_access = datetime.now(timezone.utc)
+            return stream_id
         if existing and (
             existing.normalization_input_id or existing.normalization_parent_id
         ):
@@ -928,16 +1061,15 @@ class StreamManager:
 
         if stream_id not in self.streams:
             now = datetime.now(timezone.utc)
+            if user_agent is None and parent_stream_id in self.streams:
+                user_agent = self.streams[parent_stream_id].user_agent
             if user_agent is None:
                 user_agent = settings.DEFAULT_USER_AGENT
 
             # Detect stream type
             is_hls, is_vod, is_live_continuous = self._detect_stream_type(stream_url)
 
-            # If this is a variant stream, inherit user agent from parent
             is_variant = parent_stream_id is not None
-            if is_variant and parent_stream_id in self.streams:
-                user_agent = self.streams[parent_stream_id].user_agent
 
             # Determine use_sticky_session: use parameter if provided, otherwise use global config
             effective_use_sticky_session = (
@@ -959,9 +1091,11 @@ class StreamManager:
                 is_vod=is_vod,
                 is_live_continuous=is_live_continuous,
                 parent_stream_id=parent_stream_id,
+                media_parent_context=parent_binding,
                 is_variant_stream=is_variant,
                 metadata=metadata or {},
                 headers=headers or {},
+                media_header_origin=url_origin(stream_url),
                 is_transcoded=is_transcoded,
                 transcode_profile=transcode_profile,
                 transcode_ffmpeg_args=transcode_ffmpeg_args or [],
@@ -4793,6 +4927,7 @@ class StreamManager:
             # Update stream info
             old_url = stream_info.current_url
             stream_info.current_url = next_url
+            stream_info.media_header_origin = url_origin(next_url)
             # Note: current_failover_index is already incremented by _resolve_next_failover_url
             stream_info.failover_attempts += 1
             stream_info.last_failover_time = datetime.now(timezone.utc)
@@ -4848,6 +4983,8 @@ class StreamManager:
         """Get and process playlist content for HLS streams"""
         if stream_id not in self.streams:
             return None
+        if not self.media_context(stream_id):
+            raise HTTPException(status_code=403, detail="Invalid media context")
 
         stream_info = self.streams[stream_id]
 
@@ -5060,6 +5197,9 @@ class StreamManager:
                         # Construct pseudo-final URL based on local file path so M3U8Processor can compute bases
                         final_url = f"file://{shared_process.hls_dir}/index.m3u8"
                         stream_info.final_playlist_url = final_url
+                        stream_info.media_local_dir = os.path.realpath(
+                            shared_process.hls_dir
+                        )
 
                         parsed_url = urlparse(final_url)
                         base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
@@ -5072,17 +5212,13 @@ class StreamManager:
                         else:
                             base_url += "/"
 
-                        parent_id = (
-                            stream_id
-                            if not stream_info.is_variant_stream
-                            else stream_info.parent_stream_id
-                        )
                         processor = M3U8Processor(
                             base_proxy_url,
                             client_id,
                             stream_info.user_agent,
                             final_url,
-                            parent_stream_id=parent_id,
+                            parent_stream_id=stream_id,
+                            signing_context=self.media_context(stream_id),
                         )
                         processed_content = processor.process_playlist(
                             playlist_text, base_proxy_url, base_url
@@ -5127,9 +5263,16 @@ class StreamManager:
                 logger.info(
                     f"Fetching HLS playlist from: {current_url} (attempt {attempt + 1}/{max_attempts})"
                 )
-                headers = {"User-Agent": stream_info.user_agent}
-                headers.update(stream_info.headers)
-                response = await self.http_client.get(current_url, headers=headers)
+                header_origin = stream_info.media_header_origin
+                if header_origin is None:
+                    header_origin = url_origin(stream_info.original_url)
+                headers = {"User-Agent": settings.DEFAULT_USER_AGENT}
+                if url_origin(current_url) == header_origin:
+                    headers = {
+                        "User-Agent": stream_info.user_agent,
+                        **stream_info.headers,
+                    }
+                response = await self._media_get(current_url, headers=headers)
                 response.raise_for_status()
 
                 content = response.text
@@ -5162,18 +5305,14 @@ class StreamManager:
                 else:
                     base_url += "/"
 
-                # Pass stream_id as parent for variant playlists, unless this is already a variant
-                parent_id = (
-                    stream_id
-                    if not stream_info.is_variant_stream
-                    else stream_info.parent_stream_id
-                )
                 processor = M3U8Processor(
                     base_proxy_url,
                     client_id,
                     stream_info.user_agent,
                     final_url,
-                    parent_stream_id=parent_id,
+                    parent_stream_id=stream_id,
+                    signing_context=self.media_context(stream_id),
+                    header_origin=header_origin,
                 )
                 processed_content = processor.process_playlist(
                     content, base_proxy_url, base_url
@@ -5269,9 +5408,16 @@ class StreamManager:
                 logger.info(
                     f"Fetching DASH manifest from: {current_url} (attempt {attempt + 1}/{max_attempts})"
                 )
-                headers = {"User-Agent": stream_info.user_agent}
-                headers.update(stream_info.headers)
-                response = await self.http_client.get(current_url, headers=headers)
+                header_origin = stream_info.media_header_origin
+                if header_origin is None:
+                    header_origin = url_origin(stream_info.original_url)
+                headers = {"User-Agent": settings.DEFAULT_USER_AGENT}
+                if url_origin(current_url) == header_origin:
+                    headers = {
+                        "User-Agent": stream_info.user_agent,
+                        **stream_info.headers,
+                    }
+                response = await self._media_get(current_url, headers=headers)
                 response.raise_for_status()
 
                 content = response.text
@@ -5301,6 +5447,8 @@ class StreamManager:
                     client_id,
                     stream_info.user_agent,
                     final_url,
+                    signing_context=self.media_context(stream_id),
+                    header_origin=header_origin,
                 )
                 processed_content = processor.process_manifest(
                     content, base_proxy_url, base_url
@@ -5365,8 +5513,10 @@ class StreamManager:
         client_id: str,
         segment_url: str,
         range_header: Optional[str] = None,
+        source_headers: Optional[Dict[str, str]] = None,
     ) -> StreamingResponse:
         """Proxy an individual DASH segment/init-section - direct pass-through with header propagation."""
+
         logger.info(f"Proxying DASH segment for stream {stream_id}, client {client_id}")
 
         async def segment_generator():
@@ -5386,9 +5536,11 @@ class StreamManager:
                         headers["User-Agent"] = stream_info.user_agent
                         headers.update(stream_info.headers)
 
-                    async with self.http_client.stream(
-                        "GET", segment_url, headers=headers, follow_redirects=True
-                    ) as response:
+                    if source_headers is not None:
+                        headers = dict(source_headers)
+                        if range_header:
+                            headers["Range"] = range_header
+                    async with self._media_stream(segment_url, headers) as response:
                         response.raise_for_status()
                         async for chunk in response.aiter_bytes(chunk_size=32768):
                             yield chunk
@@ -5502,6 +5654,7 @@ class StreamManager:
         client_id: str,
         segment_url: str,
         range_header: Optional[str] = None,
+        source_headers: Optional[Dict[str, str]] = None,
     ) -> StreamingResponse:
         """Proxy individual HLS segment - direct pass-through with automatic failover"""
         logger.info(f"Proxying HLS segment for stream {stream_id}, client {client_id}")
@@ -5511,6 +5664,16 @@ class StreamManager:
         local_path = None
         if segment_url.startswith("file://") or os.path.exists(segment_url):
             local_path = self._local_segment_path(segment_url)
+            info = self.streams.get(stream_id)
+            if (
+                info is None
+                or not info.media_local_dir
+                or not local_path
+                or not local_path.startswith(
+                    os.path.realpath(info.media_local_dir) + os.sep
+                )
+            ):
+                local_path = None
             if local_path is None:
                 logger.warning(
                     f"Refusing local segment outside transcoder output for stream {stream_id}"
@@ -5536,6 +5699,10 @@ class StreamManager:
                         headers.update(stream_info.headers)
 
                     # If the segment is a local file generated by an HLS transcoder, read from disk
+                    if source_headers is not None:
+                        headers = dict(source_headers)
+                        if range_header:
+                            headers["Range"] = range_header
                     if local_path:
                         with open(local_path, "rb") as fh:
                             while True:
@@ -5545,9 +5712,7 @@ class StreamManager:
                                 yield chunk
                                 bytes_served += len(chunk)
                     else:
-                        async with self.http_client.stream(
-                            "GET", segment_url, headers=headers, follow_redirects=True
-                        ) as response:
+                        async with self._media_stream(segment_url, headers) as response:
                             response.raise_for_status()
 
                             async for chunk in response.aiter_bytes(chunk_size=32768):
@@ -5838,6 +6003,7 @@ class StreamManager:
 
         # Update stream info
         stream_info.current_url = next_url
+        stream_info.media_header_origin = url_origin(next_url)
         stream_info.failover_attempts += 1
         stream_info.last_failover_time = datetime.now(timezone.utc)
 

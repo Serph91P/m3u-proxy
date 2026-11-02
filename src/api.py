@@ -23,7 +23,7 @@ from transcoding import get_profile_manager
 from redis_config import get_redis_config, should_use_pooling
 from hwaccel import hw_accel
 from broadcast_manager import BroadcastManager, BroadcastConfig
-from url_signing import verify_url
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -773,6 +773,7 @@ async def get_info():
 
 async def resolve_stream_id(
     stream_id: str,
+    request: Request,
     url: Optional[str] = Query(
         None, description="Stream URL (for direct access, overrides stream_id in path)"
     ),
@@ -797,15 +798,31 @@ async def resolve_stream_id(
     If parent is provided, the created stream will be marked as a variant of the parent.
     """
     if url:
-        if not verify_url(url, sig):
+        variant_headers = None
+        if sig:
+            if (
+                request.url.path.endswith("/playlist.m3u8")
+                and "/hls/" in request.url.path
+            ):
+                variant_headers = stream_manager.media_headers(
+                    stream_id, url, sig, f"hls-playlist:{parent or ''}"
+                )
+            else:
+                raise HTTPException(status_code=403, detail="Invalid media capability")
+        else:
             await verify_token(x_api_token, api_token)
         try:
-            decoded_url = unquote(url)
+            decoded_url = url
             validate_url(decoded_url)
             # If parent is provided, this is a variant stream
             parent_id = parent if parent else None
             return await stream_manager.get_or_create_stream(
-                decoded_url, parent_stream_id=parent_id
+                decoded_url,
+                parent_stream_id=parent_id,
+                headers=variant_headers,
+                user_agent=variant_headers.get("User-Agent")
+                if variant_headers is not None
+                else None,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid URL provided: {e}")
@@ -817,6 +834,8 @@ async def resolve_stream_id(
 
     if stream_id not in stream_manager.streams:
         raise HTTPException(status_code=404, detail="Stream not found")
+    if not stream_manager.media_context(stream_id):
+        raise HTTPException(status_code=403, detail="Invalid media context")
 
     return stream_id
 
@@ -1349,12 +1368,11 @@ async def get_hls_segment(
 ):
     """Proxy HLS segment for a client"""
     # Only segment URLs this proxy wrote into a playlist may be fetched.
-    if not verify_url(url, sig):
-        raise HTTPException(status_code=403, detail="Invalid segment signature")
+    source_headers = stream_manager.media_headers(stream_id, url, sig, "hls-segment")
 
     try:
         # Decode the URL
-        segment_url = unquote(url)
+        segment_url = url
 
         # Get range header if present
         range_header = request.headers.get("range")
@@ -1407,6 +1425,7 @@ async def get_hls_segment(
                 client_id,
                 segment_url,  # The actual segment URL to fetch
                 range_header,
+                source_headers=source_headers,
             )
             return response
         except HTTPException:
@@ -1610,7 +1629,8 @@ async def get_dash_segment_by_base(
     URL must stay on the signed base's scheme and host - a `path` such as
     `//other-host/x` would otherwise replace the host during urljoin.
     """
-    base_url = DashProcessor.verify_base(encoded_base)
+    context = stream_manager.media_context(stream_id)
+    base_url = DashProcessor.verify_base(encoded_base, context) if context else None
     if base_url is None:
         raise HTTPException(status_code=403, detail="Invalid segment signature")
     segment_url = urljoin(base_url, path)
@@ -1620,6 +1640,10 @@ async def get_dash_segment_by_base(
         parsed_base.netloc,
     ):
         raise HTTPException(status_code=403, detail="Segment not allowed")
+
+    source_headers = stream_manager.media_headers(
+        stream_id, base_url, encoded_base.partition(".")[2], "dash-base"
+    )
 
     try:
         client_id = unquote(client_seg)
@@ -1635,7 +1659,11 @@ async def get_dash_segment_by_base(
         )
 
         return await stream_manager.proxy_dash_segment(
-            stream_id, client_id, segment_url, range_header
+            stream_id,
+            client_id,
+            segment_url,
+            range_header,
+            source_headers=source_headers,
         )
     except Exception as e:
         logger.error(f"Error serving DASH segment: {e}")
@@ -1655,11 +1683,10 @@ async def get_dash_file(
     """Proxy a fully-qualified DASH segment/init URL (SegmentList). This route is
     the direct DASH counterpart of the HLS segment route - identical signature
     (`client_id` + `url` required query params), identical body."""
-    if not verify_url(url, sig):
-        raise HTTPException(status_code=403, detail="Invalid segment signature")
+    source_headers = stream_manager.media_headers(stream_id, url, sig, "dash-file")
 
     try:
-        segment_url = unquote(url)
+        segment_url = url
         range_header = request.headers.get("range")
 
         client_info_data = get_client_info(request)
@@ -1672,7 +1699,11 @@ async def get_dash_file(
         )
 
         return await stream_manager.proxy_dash_segment(
-            stream_id, client_id, segment_url, range_header
+            stream_id,
+            client_id,
+            segment_url,
+            range_header,
+            source_headers=source_headers,
         )
     except Exception as e:
         logger.error(f"Error serving DASH segment: {e}")
